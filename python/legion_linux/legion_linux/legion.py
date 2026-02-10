@@ -953,41 +953,16 @@ class FanCurveIO(Feature):
         # pylint: disable=broad-except
         except BaseException as error:
             log.error(str(error))
-        # Sanitize entries to ensure monotonicity and valid tail
-        last_entry = None
-        for index, entry in enumerate(fan_curve.entries):
-            # Ensure monotonicity for temperatures
-            if last_entry:
-                # If temp is 0 (unused) or less than previous, fix it
-                # We prioritize setting unused tail to 127 to allow future insertions
-                if entry.cpu_upper_temp == 0 or entry.cpu_upper_temp < last_entry.cpu_upper_temp:
-                    entry.cpu_upper_temp = max(last_entry.cpu_upper_temp, 127 if entry.cpu_upper_temp == 0 else entry.cpu_upper_temp)
-                if entry.cpu_lower_temp == 0 or entry.cpu_lower_temp < last_entry.cpu_lower_temp:
-                    entry.cpu_lower_temp = max(last_entry.cpu_lower_temp, 127 if entry.cpu_lower_temp == 0 else entry.cpu_lower_temp)
-
-                if entry.gpu_upper_temp == 0 or entry.gpu_upper_temp < last_entry.gpu_upper_temp:
-                    entry.gpu_upper_temp = max(last_entry.gpu_upper_temp, 127 if entry.gpu_upper_temp == 0 else entry.gpu_upper_temp)
-                if entry.gpu_lower_temp == 0 or entry.gpu_lower_temp < last_entry.gpu_lower_temp:
-                    entry.gpu_lower_temp = max(last_entry.gpu_lower_temp, 127 if entry.gpu_lower_temp == 0 else entry.gpu_lower_temp)
-
-                if entry.ic_upper_temp == 0 or entry.ic_upper_temp < last_entry.ic_upper_temp:
-                    entry.ic_upper_temp = max(last_entry.ic_upper_temp, 127 if entry.ic_upper_temp == 0 else entry.ic_upper_temp)
-                if entry.ic_lower_temp == 0 or entry.ic_lower_temp < last_entry.ic_lower_temp:
-                    entry.ic_lower_temp = max(last_entry.ic_lower_temp, 127 if entry.ic_lower_temp == 0 else entry.ic_lower_temp)
-
-                # Prevent speed drop-off in unused tail
-                if entry.fan1_speed == 0:
-                     entry.fan1_speed = last_entry.fan1_speed
-                if entry.fan2_speed == 0:
-                     entry.fan2_speed = last_entry.fan2_speed
-
-            # Sanity check: Upper >= Lower
+        # REMOVED: Automatic sanitization was causing unwanted overrides
+        # The previous code was converting 0 values to 127 and copying fan speeds
+        # This prevented users from setting their desired values
+        # The kernel module and EC firmware provide their own validation
+        
+        # Minimal validation: Ensure Upper >= Lower for each entry
+        for entry in fan_curve.entries:
             entry.cpu_upper_temp = max(entry.cpu_upper_temp, entry.cpu_lower_temp)
             entry.gpu_upper_temp = max(entry.gpu_upper_temp, entry.gpu_lower_temp)
             entry.ic_upper_temp = max(entry.ic_upper_temp, entry.ic_lower_temp)
-
-            
-            last_entry = entry
 
         # Write in reverse order (10 to 1) to satisfy monotonicity constraints of the hardware
         reversed_entries = fan_curve.entries[::-1]
