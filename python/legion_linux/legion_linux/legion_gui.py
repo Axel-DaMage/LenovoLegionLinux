@@ -907,6 +907,12 @@ class LegionController:
     def save_settings(self):
         try:
             self.model.save_settings()
+            # Save FanCurve to current preset
+            if self.view_fancurve:
+                name = self.view_fancurve.preset_combobox.currentText()
+                self.model.fan_curve = self.view_fancurve.get_fancurve()
+                self.model.save_fancurve_to_preset(name)
+                log.info(f"Saved FanCurve to preset: {name}")
         except PermissionError as err:
             log_error(err)
 
