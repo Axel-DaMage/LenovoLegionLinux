@@ -800,6 +800,8 @@ class FanCurveIO(Feature):
     def get_fan_1_max_rpm(self):
         file_path = self.hwmon_path + self.fan1_max
         val = int(self._read_file(file_path))
+        # Hardware reports 10000 as placeholder, but actual max is ~4500 RPM
+        # Using 4500 for correct PWM conversion
         if val >= 10000:
             return 4500
         return val
@@ -807,6 +809,8 @@ class FanCurveIO(Feature):
     def get_fan_2_max_rpm(self):
         file_path = self.hwmon_path + self.fan2_max
         val = int(self._read_file(file_path))
+        # Hardware reports 10000 as placeholder, but actual max is ~4500 RPM
+        # Using 4500 for correct PWM conversion
         if val >= 10000:
             return 4500
         return val
