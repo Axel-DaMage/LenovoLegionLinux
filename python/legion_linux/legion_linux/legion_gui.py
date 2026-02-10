@@ -1747,6 +1747,11 @@ def main():
     """)
 
     use_legion_cli_to_write = '--use_legion_cli_to_write' in sys.argv
+    # When running as a regular user, writing to sysfs will fail and can cause the GUI
+    # to exit unexpectedly depending on the code path. Default to using the CLI via
+    # pkexec/polkit for privileged writes.
+    if (not use_legion_cli_to_write) and (os.geteuid() != 0):
+        use_legion_cli_to_write = True
     do_not_excpect_hwmon = False
     controller = LegionController(app, expect_hwmon=not do_not_excpect_hwmon,
                              use_legion_cli_to_write=use_legion_cli_to_write)
