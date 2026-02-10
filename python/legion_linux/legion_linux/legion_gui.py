@@ -121,8 +121,11 @@ def mark_error_combobox(combobox: QComboBox):
 
 
 def log_error(ex: Exception):
-    print("Error occured", ex)
-    print(traceback.format_exc())
+    if isinstance(ex, OSError) and ex.errno == 22:
+        print("Feature not supported or invalid argument (Errno 22).")
+    else:
+        print("Error occured", ex)
+        print(traceback.format_exc())
 
 
 
@@ -338,17 +341,27 @@ class PresetTrayController:
         self.update_view_from_feature()
 
     def update_view_from_feature(self):
+        preset_names = list(self.model.fancurve_repo.get_names())
         for i, action in enumerate(self.actions):
-            name = list(self.model.fancurve_repo.get_names())[i]
-            action.setText(f"Apply preset {name}")
-            action.setCheckable(False)
-            action.setDisabled(not self.model.fancurve_repo.does_exists_by_name(name))
+            if i < len(preset_names):
+                name = preset_names[i]
+                action.setVisible(True)
+                action.setText(f"Apply preset {name}")
+                action.setCheckable(False)
+                action.setDisabled(not self.model.fancurve_repo.does_exists_by_name(name))
 
-            # Connect function to set respective preset and
-            # take current value of name into closure
-            def callback(_, pname = name):
-                self.on_action_click(pname)
-            action.triggered.connect(callback)
+                # Connect function to set respective preset and
+                # take current value of name into closure
+                def callback(_, pname = name):
+                    self.on_action_click(pname)
+                # Disconnect previous if any to avoid multiple connections
+                try: 
+                    action.triggered.disconnect()
+                except: 
+                    pass
+                action.triggered.connect(callback)
+            else:
+                action.setVisible(False)
 
     def on_action_click(self, name):
         log.info("Setting preset %s from tray action", name)
@@ -574,9 +587,6 @@ class LegionController:
     gpu_ctgp_power_limit_controller: IntFeatureController
     gpu_ppab_power_limit_controller: IntFeatureController
     gpu_temperature_limit_controller: IntFeatureController
-    # light
-    ylogo_light_controller: BoolFeatureController
-    ioport_light_controller: BoolFeatureController
     # deamon and automation
     power_profiles_deamon_service_controller: BoolFeatureController
     lenovo_legion_laptop_support_service_controller: BoolFeatureController
@@ -693,13 +703,6 @@ class LegionController:
             self.view_otheroptions.gpu_temperature_limit_spinbox,
             self.model.gpu_temperature_limit)
 
-        # light
-        self.ylogo_light_controller = BoolFeatureController(
-            self.view_otheroptions.ylogo_light_check,
-            self.model.ylogo_light)
-        self.ioport_light_controller = BoolFeatureController(
-            self.view_otheroptions.ioport_light_check,
-            self.model.ioport_light)
 
         # services and automation
         self.power_profiles_deamon_service_controller = BoolFeatureController(
@@ -870,6 +873,18 @@ class LegionController:
         self.update_fancurve_gui()
 
     def on_write_fan_curve_to_hw(self):
+        # Debugging
+        import legion_linux.legion
+        print(f"DEBUG: legion module file: {legion_linux.legion.__file__}")
+        try:
+            print(f"DEBUG: Max RPM 1: {self.model.fancurve_io.get_fan_1_max_rpm()}")
+        except Exception as e:
+            print(f"DEBUG: Error getting Max RPM: {e}")
+        
+        self.model.fan_curve = self.view_fancurve.get_fancurve()
+        self.model.write_fancurve_to_hw()
+        self.model.read_fancurve_from_hw()
+        self.update_fancurve_gui()
         self.model.fan_curve = self.view_fancurve.get_fancurve()
         self.model.write_fancurve_to_hw()
         self.model.read_fancurve_from_hw()
@@ -953,8 +968,8 @@ class FanCurveEntryView():
         layout.addWidget(self.decel_edit, 10, point_id)
 
     def set(self, entry: FanCurveEntry):
-        self.fan_speed1_edit.setText(str(entry.fan1_speed))
-        self.fan_speed2_edit.setText(str(entry.fan2_speed))
+        self.fan_speed1_edit.setText(str(int(entry.fan1_speed)))
+        self.fan_speed2_edit.setText(str(int(entry.fan2_speed)))
         self.cpu_lower_temp_edit.setText(str(entry.cpu_lower_temp))
         self.cpu_upper_temp_edit.setText(str(entry.cpu_upper_temp))
         self.gpu_lower_temp_edit.setText(str(entry.gpu_lower_temp))
@@ -1105,13 +1120,7 @@ class FanCurveTab(QWidget):
         self.main_layout.addWidget(self.button1_group, 1)
         self.main_layout.addWidget(self.button2_group, 2)
 
-        self.note_label2 = QLabel(
-            "Greyed out features are not available. If most features are greyed out, "
-            "the driver is not loaded properly or hwmon directory not found.\nIf features are marked "
-            "red, an unexpected error has occured while accessing the hardware and you should notify the maintainer.")
-        self.note_label2.setStyleSheet("color: red;")
-        self.note_label2.setWordWrap(True)
-        self.main_layout.addWidget(self.note_label2, 3)
+
 
         self.setLayout(self.main_layout)
 
@@ -1161,13 +1170,6 @@ class OtherOptionsTab(QWidget):
             "Display Overdrive Enabled")
         self.options_layout.addWidget(self.overdrive_check, 5)
 
-        self.ylogo_light_check = QCheckBox(
-            "Y-Logo/Lid LED light")
-        self.options_layout.addWidget(self.ylogo_light_check, 5)
-
-        self.ioport_light_check = QCheckBox(
-            "IO-Port/Rear LEDs light")
-        self.options_layout.addWidget(self.ioport_light_check, 5)
 
         self.hybrid_label = QLabel('Hybrid Mode (sometimes also GSync):')
         self.hybrid_state_label = QLabel('')
@@ -1320,12 +1322,7 @@ class OtherOptionsTab(QWidget):
         self.power_layout.addWidget(self.power_load_button, 11, 0)
         self.power_layout.addWidget(self.power_write_button, 11, 1)
 
-        self.power_note_label = QLabel(
-            "It is recommended to customize the power settings only in custom mode. Although "
-            "it is possible to change them in any mode.")
-        self.power_note_label.setStyleSheet("color: red;")
-        self.power_note_label.setWordWrap(True)
-        self.power_all_layout.addWidget(self.power_note_label)
+
 
 
 class AutomationTab(QWidget):
@@ -1379,22 +1376,11 @@ class AutomationTab(QWidget):
         self.options_layout.addWidget(
             self.enable_gui_monitoring_check, 3)
 
-        self.note_label = QLabel(
-            'These are Experimental Features.\n To apply and save the Settings Press "Save" or "Save and Quit"')
-        self.options_layout.addWidget(self.note_label, 4)
 
-        self.note_openrc_label = QLabel(
-            "OpenRC service are available but need to be enable manually!\n"
-            "They are install automatically on gentoo base distro!\n"
-            "To get the files go to extra/service in the repo.\n"
-        )
-        self.options_layout.addWidget(self.note_openrc_label, 4)
 
-        self.note_label2 = QLabel("")
 
         self.main_layout = QVBoxLayout()
         self.main_layout.addWidget(self.options_group, 0)
-        self.main_layout.addWidget(self.note_label2, 4)
         self.setLayout(self.main_layout)
 
 # pylint: disable=too-few-public-methods
@@ -1414,20 +1400,7 @@ class LogTab(QWidget):
         self.setLayout(layout)
 
 # pylint: disable=too-few-public-methods
-class AboutTab(QWidget):
-    def __init__(self, _):
-        super().__init__()
-        self.init_ui()
 
-    def init_ui(self):
-        # pylint: disable=line-too-long
-        about_label = QLabel(
-            'Help by giving a star to the github repo <a href="https://github.com/johnfanv2/LenovoLegionLinux" >https://github.com/johnfanv2/LenovoLegionLinux</a>')
-        about_label.setOpenExternalLinks(True)
-        about_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout = QVBoxLayout()
-        layout.addWidget(about_label)
-        self.setLayout(layout)
 
 # pylint: disable=too-few-public-methods
 class Tabs(QTabWidget):
@@ -1442,8 +1415,7 @@ class Tabs(QTabWidget):
             ("Fan Curve", FanCurveTab(controller)),
             ("Other Options", OtherOptionsTab(controller)),
             ("Automation", AutomationTab(controller)),
-            ("Log", LogTab(controller)),
-            ("About", AboutTab(controller))
+            ("Log", LogTab(controller))
         )
 
         for tab_name, tab in self.tabs:
@@ -1453,12 +1425,7 @@ class Tabs(QTabWidget):
             self.addTab(area, tab_name)
 
 
-class QClickLabel(QLabel):
-    clicked = QtCore.pyqtSignal()
 
-    # pylint: disable=invalid-name
-    def mousePressEvent(self, _):
-        self.clicked.emit()
 
 # pylint: disable=too-few-public-methods
 
@@ -1480,10 +1447,7 @@ class MainWindow(QMainWindow):
         self.icon = icon
         self.setWindowIcon(self.icon)
 
-        # header message
-        self.header_msg = QClickLabel()
-        # self.header_msg.clicked.connect(open_star_link)
-        self.set_random_header_msg()
+
 
         # tabs
         self.tabs = Tabs(controller)
@@ -1504,7 +1468,7 @@ class MainWindow(QMainWindow):
 
         # main layout
         self.main_layout = QVBoxLayout()
-        self.main_layout.addWidget(self.header_msg)
+
         self.main_layout.addWidget(self.tabs, 1)
         self.main_layout.addLayout(self.button_layout)
 
@@ -1523,21 +1487,7 @@ class MainWindow(QMainWindow):
         # timer to automatically close window during testing in CI
         self.close_timer = QTimer()
 
-    def set_header_msg(self, text: str):
-        self.header_msg.setText(text)
-        self.header_msg.setOpenExternalLinks(True)
-        self.header_msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-    def set_random_header_msg(self):
-        # pylint: disable=line-too-long
-        msgs = [
-            'Show your appreciation for this tool by giving a star on github <a href="https://github.com/johnfanv2/LenovoLegionLinux" >https://github.com/johnfanv2/LenovoLegionLinux</a>',
-            'Help by giving a star to the github repository <a href="https://github.com/johnfanv2/LenovoLegionLinux" >https://github.com/johnfanv2/LenovoLegionLinux</a>',
-            'Please give a star on github to support. My goal is to merge the driver into the main Linux kernel,<br> so no recompilation is required after a Linux update <a href="https://github.com/johnfanv2/LenovoLegionLinux" >https://github.com/johnfanv2/LenovoLegionLinux</a'
-            'Please give star on github the repository if this is useful or might be useful in the future <a href="https://github.com/johnfanv2/LenovoLegionLinux" >https://github.com/johnfanv2/LenovoLegionLinux</a>',
-            'Please give a star on github to show that this it useful to me and the Linux community,<br> so hopefully the driver can be merged to the Linux kernel <a href="https://github.com/johnfanv2/LenovoLegionLinux" >https://github.com/johnfanv2/LenovoLegionLinux</a>'
-        ]
-        self.set_header_msg(random.choice(msgs))
 
     def on_start(self):
         if self.show_root_dialog:
@@ -1638,12 +1588,7 @@ class LegionTray:
         self.powermode2_action = add_action("powermode")
         self.powermode3_action = add_action("powermode")
         self.powermode4_action = add_action("powermode")
-        # ---
-        self.menu.addSeparator()
-        self.star_action = QAction(
-            "Help giving a star to the github repo (click here)")
-        self.star_action.triggered.connect(open_star_link)
-        self.menu.addAction(self.star_action)
+
 
     def show_message(self, title):
         self.tray.setToolTip(title)
@@ -1706,9 +1651,103 @@ def main():
     QGuiApplication.setDesktopFileName("legion_gui.desktop")
 
     app = QApplication(sys.argv)
+    
+    # Futuristic Dark Theme
+    app.setStyleSheet("""
+        QWidget {
+            background-color: #0E110E;
+            color: #FFFFFF;
+            font-family: 'Segoe UI', 'Roboto', sans-serif;
+            font-size: 13px;
+        }
+        QMainWindow, QDialog, QTabWidget::pane {
+            border: 1px solid #202C41;
+        }
+        QGroupBox {
+            border: 2px solid #202C41;
+            border-radius: 8px;
+            margin-top: 15px;
+            font-weight: bold;
+            color: #FFFFFF;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            left: 10px;
+            padding: 0 5px 0 5px;
+        }
+        QPushButton {
+            background-color: #202C41;
+            border: 1px solid #43D2DE;
+            border-radius: 4px;
+            padding: 6px 12px;
+            color: #FFFFFF;
+        }
+        QPushButton:hover {
+            background-color: #343F52;
+            border: 1px solid #E54297;
+        }
+        QPushButton:pressed {
+            background-color: #1E3CDE;
+        }
+        QLineEdit, QSpinBox, QComboBox {
+            background-color: #0E110E;
+            border: 1px solid #343F52;
+            border-radius: 4px;
+            padding: 4px;
+            color: #FFFFFF;
+        }
+        QLineEdit:focus, QSpinBox:focus, QComboBox:focus {
+            border: 1px solid #43D2DE;
+        }
+        QTabWidget::tab-bar {
+            left: 5px;
+        }
+        QTabBar::tab {
+            background: #202C41;
+            border: 1px solid #343F52;
+            padding: 8px 15px;
+            border-top-left-radius: 4px;
+            border-top-right-radius: 4px;
+            color: #8DC8E6;
+        }
+        QTabBar::tab:selected {
+            background: #43D2DE;
+            color: #0E110E;
+            border: none;
+        }
+        QTabBar::tab:hover:!selected {
+            background: #313844;
+        }
+        QCheckBox {
+            color: #FFFFFF;
+        }
+        QCheckBox::indicator {
+            width: 18px;
+            height: 18px;
+            background-color: #202C41;
+            border: 1px solid #343F52;
+            border-radius: 3px;
+        }
+        QCheckBox::indicator:checked {
+            background-color: #E54297;
+            border: none;
+        }
+        QScrollArea {
+            border: none;
+            background-color: #0E110E;
+        }
+        QTextBrowser {
+            background-color: #000000;
+            border: 1px solid #202C41;
+            color: #FFFFFF;
+        }
+        QLabel[styleSheet*="color: red"] {
+            color: #E54297 !important;
+        }
+    """)
 
     use_legion_cli_to_write = '--use_legion_cli_to_write' in sys.argv
-    do_not_excpect_hwmon = True
+    do_not_excpect_hwmon = False
     controller = LegionController(app, expect_hwmon=not do_not_excpect_hwmon,
                              use_legion_cli_to_write=use_legion_cli_to_write)
 

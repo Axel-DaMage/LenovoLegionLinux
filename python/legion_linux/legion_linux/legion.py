@@ -799,11 +799,17 @@ class FanCurveIO(Feature):
 
     def get_fan_1_max_rpm(self):
         file_path = self.hwmon_path + self.fan1_max
-        return int(self._read_file(file_path))
+        val = int(self._read_file(file_path))
+        if val >= 10000:
+            return 4500
+        return val
 
     def get_fan_2_max_rpm(self):
         file_path = self.hwmon_path + self.fan2_max
-        return int(self._read_file(file_path))
+        val = int(self._read_file(file_path))
+        if val >= 10000:
+            return 4500
+        return val
 
     def set_fan_1_speed_pwm(self, point_id, value):
         point_id = self._validate_point_id(point_id)
@@ -947,8 +953,46 @@ class FanCurveIO(Feature):
         # pylint: disable=broad-except
         except BaseException as error:
             log.error(str(error))
+        # Sanitize entries to ensure monotonicity and valid tail
+        last_entry = None
         for index, entry in enumerate(fan_curve.entries):
-            point_id = index + 1
+            # Ensure monotonicity for temperatures
+            if last_entry:
+                # If temp is 0 (unused) or less than previous, fix it
+                # We prioritize setting unused tail to 127 to allow future insertions
+                if entry.cpu_upper_temp == 0 or entry.cpu_upper_temp < last_entry.cpu_upper_temp:
+                    entry.cpu_upper_temp = max(last_entry.cpu_upper_temp, 127 if entry.cpu_upper_temp == 0 else entry.cpu_upper_temp)
+                if entry.cpu_lower_temp == 0 or entry.cpu_lower_temp < last_entry.cpu_lower_temp:
+                    entry.cpu_lower_temp = max(last_entry.cpu_lower_temp, 127 if entry.cpu_lower_temp == 0 else entry.cpu_lower_temp)
+
+                if entry.gpu_upper_temp == 0 or entry.gpu_upper_temp < last_entry.gpu_upper_temp:
+                    entry.gpu_upper_temp = max(last_entry.gpu_upper_temp, 127 if entry.gpu_upper_temp == 0 else entry.gpu_upper_temp)
+                if entry.gpu_lower_temp == 0 or entry.gpu_lower_temp < last_entry.gpu_lower_temp:
+                    entry.gpu_lower_temp = max(last_entry.gpu_lower_temp, 127 if entry.gpu_lower_temp == 0 else entry.gpu_lower_temp)
+
+                if entry.ic_upper_temp == 0 or entry.ic_upper_temp < last_entry.ic_upper_temp:
+                    entry.ic_upper_temp = max(last_entry.ic_upper_temp, 127 if entry.ic_upper_temp == 0 else entry.ic_upper_temp)
+                if entry.ic_lower_temp == 0 or entry.ic_lower_temp < last_entry.ic_lower_temp:
+                    entry.ic_lower_temp = max(last_entry.ic_lower_temp, 127 if entry.ic_lower_temp == 0 else entry.ic_lower_temp)
+
+                # Prevent speed drop-off in unused tail
+                if entry.fan1_speed == 0:
+                     entry.fan1_speed = last_entry.fan1_speed
+                if entry.fan2_speed == 0:
+                     entry.fan2_speed = last_entry.fan2_speed
+
+            # Sanity check: Upper >= Lower
+            entry.cpu_upper_temp = max(entry.cpu_upper_temp, entry.cpu_lower_temp)
+            entry.gpu_upper_temp = max(entry.gpu_upper_temp, entry.gpu_lower_temp)
+            entry.ic_upper_temp = max(entry.ic_upper_temp, entry.ic_lower_temp)
+
+            
+            last_entry = entry
+
+        # Write in reverse order (10 to 1) to satisfy monotonicity constraints of the hardware
+        reversed_entries = fan_curve.entries[::-1]
+        for index, entry in enumerate(reversed_entries):
+            point_id = 10 - index
             self.set_fan_1_speed_rpm(point_id, entry.fan1_speed)
             self.set_fan_2_speed_rpm(point_id, entry.fan2_speed)
             self.set_lower_cpu_temperature(point_id, entry.cpu_lower_temp)
@@ -1086,23 +1130,20 @@ class FanCurveRepository(Feature):
     def __init__(self, preset_dir):
         super().__init__()
         self.fancurve_presets = {
-            "quiet-battery": None,
-            "balanced-battery": None,
-            "performance-battery": None,
-            "balanced-performance-battery": None,
-            "quiet-ac": None,
-            "balanced-ac": None,
-            "performance-ac": None,
-            "balanced-performance-ac": None
+            "quiet": None,
+            "balanced": None,
+            "performance": None
         }
 
         self.preset_dir = preset_dir
 
     @staticmethod
     def get_preset_name(profile: str, is_on_powersupply: bool):
-        symb = "ac" if is_on_powersupply else "battery"
-        preset_name = f"{profile}-{symb}"
-        return preset_name
+        # Ignore is_on_powersupply, always return the valid profile name
+        # Map balanced-performance (Custom Mode) to balanced
+        if profile == "balanced-performance":
+            return "balanced"
+        return profile
 
     def _name_to_filename(self, name):
         return os.path.join(self.preset_dir, name+".yaml")
@@ -1114,7 +1155,12 @@ class FanCurveRepository(Feature):
         return os.path.exists(self._name_to_filename(name))
 
     def load_by_name(self, name):
-        return FanCurve.load_from_file(self._name_to_filename(name))
+        try:
+            return FanCurve.load_from_file(self._name_to_filename(name))
+        except FileNotFoundError:
+            log.warning(f"Preset {name} not found, returning default empty curve.")
+            # Return a default/empty curve to prevent crash
+            return FanCurve(name=name, entries=[FanCurveEntry(0, 0, 0, 0, 0, 0, 0, 0, 0, 0) for i in range(10)], enable_minifancurve=True)
 
     def load_by_name_or_default(self, name):
         if self.does_exists_by_name(name):
@@ -1434,11 +1480,12 @@ class LegionModelFacade:
         self.gpu_boost_clock = GPUBoostClock()
         self.gpu_ctgp_power_limit = GPUCTGPPowerLimit()
         self.gpu_ppab_power_limit = GPUPPABPowerLimit()
-        self.gpu_temperature_limit = GPUTemperatureLimit()
+        try:
+             self.gpu_temperature_limit = GPUTemperatureLimit()
+        except Exception as e:
+             log.warning(f"Could not init GPUTemperatureLimit: {e}")
+             self.gpu_temperature_limit = None
 
-        # light
-        self.ylogo_light = YLogoLight()
-        self.ioport_light = IOPortLight()
 
         # services
         self.power_profiles_deamon_service = PowerProfilesDeamonService()

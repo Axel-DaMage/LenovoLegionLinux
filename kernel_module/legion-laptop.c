@@ -261,7 +261,7 @@ static const struct ec_register_offsets ec_register_offsets_v0 = {
 	.EXT_POWERMODE = 0xc420,
 	.EXT_FAN1_TARGET_RPM = 0xc600,
 	.EXT_FAN2_TARGET_RPM = 0xc601,
-	.EXT_MAXIMUMFANSPEED = 0xBD,
+	.EXT_MAXIMUMFANSPEED = 0xC4BD,
 	.EXT_WHITE_KEYBOARD_BACKLIGHT = (0x3B + 0xC400)
 };
 
@@ -294,7 +294,7 @@ static const struct ec_register_offsets ec_register_offsets_v1 = {
 	.EXT_POWERMODE = 0xc41D,
 	.EXT_FAN1_TARGET_RPM = 0xc600,
 	.EXT_FAN2_TARGET_RPM = 0xc601,
-	.EXT_MAXIMUMFANSPEED = 0xBD,
+	.EXT_MAXIMUMFANSPEED = 0xC4BD,
 	.EXT_WHITE_KEYBOARD_BACKLIGHT = (0x3B + 0xC400)
 };
 
@@ -770,12 +770,12 @@ static const struct model_config model_eucn = {
 	.memoryio_size = 0x300,
 	.has_minifancurve = true,
 	.has_custom_powermode = true,
-	.access_method_powermode = ACCESS_METHOD_WMI,
+	.access_method_powermode = ACCESS_METHOD_EC,
 	.access_method_keyboard = ACCESS_METHOD_WMI,
 	.access_method_fanspeed = ACCESS_METHOD_EC,
 	.access_method_temperature = ACCESS_METHOD_EC,
 	.access_method_fancurve = ACCESS_METHOD_EC,
-	.access_method_fanfullspeed = ACCESS_METHOD_WMI,
+	.access_method_fanfullspeed = ACCESS_METHOD_EC,
 	.acpi_check_dev = true,
 	.ramio_physical_start = 0xFE00D400,
 	.ramio_size = 0x600
@@ -2028,8 +2028,6 @@ static ssize_t ecram_portio_write(struct ecram_portio *ec_portio, u16 offset,
 	outb(value, ECRAM_PORTIO_DATA_PORT);
 
 	mutex_unlock(&ec_portio->io_port_mutex);
-	// TODO: remove this
-	//pr_info("Writing %d to addr %x\n", value, offset);
 	return 0;
 }
 
@@ -2470,6 +2468,9 @@ struct legion_private {
 	struct fancurve fancurve;
 	// configured fan curve from user space
 	struct fancurve fancurve_configured;
+	// backup of runtime fancurve for max fan speed toggle
+	struct fancurve original_fancurve;
+	bool has_original_fancurve;
 
 	// update lock, when partial values of fancurve are changed
 	struct mutex fancurve_mutex;
@@ -3456,18 +3457,10 @@ static int ec_read_fanfullspeed(struct ecram *ecram,
 {
 	int value = ecram_read(ecram, model->registers->EXT_MAXIMUMFANSPEED);
 
-	switch (value) {
-	case EC_FANFULLSPEED_ON:
-		*state = true;
-		break;
-	case EC_FANFULLSPEED_OFF:
-		*state = false;
-		break;
-	default:
-		pr_info("Unexpected value in maximumfanspeed register: %d\n",
-			value);
+	if (value < 0)
 		return -1;
-	}
+
+	*state = !!(value & EC_FANFULLSPEED_ON);
 	return 0;
 }
 
@@ -3475,7 +3468,16 @@ static ssize_t ec_write_fanfullspeed(struct ecram *ecram,
 				     const struct model_config *model,
 				     bool state)
 {
-	u8 val = state ? EC_FANFULLSPEED_ON : EC_FANFULLSPEED_OFF;
+	int value = ecram_read(ecram, model->registers->EXT_MAXIMUMFANSPEED);
+	u8 val;
+
+	if (value < 0)
+		return -1;
+
+	if (state)
+		val = value | EC_FANFULLSPEED_ON;
+	else
+		val = value & ~EC_FANFULLSPEED_ON;
 
 	ecram_write(ecram, model->registers->EXT_MAXIMUMFANSPEED, val);
 	return 0;
@@ -3512,12 +3514,68 @@ static ssize_t read_fanfullspeed(struct legion_private *priv, bool *state)
 
 static ssize_t write_fanfullspeed(struct legion_private *priv, bool state)
 {
-	ssize_t res;
+	int err;
+	int i;
+	struct fancurve *curve;
 
 	switch (priv->conf->access_method_fanfullspeed) {
 	case ACCESS_METHOD_EC:
-		res = ec_write_fanfullspeed(&priv->ecram, priv->conf, state);
-		return res;
+		// Workaround: Use fan curve override to force max speed
+		pr_info("Legion FanMax: EC curve override requested. State: %d\n", state);
+		mutex_lock(&priv->fancurve_mutex);
+		if (state) {
+			// Read current curve to backup
+			if (!priv->has_original_fancurve) {
+				err = read_fancurve(priv, &priv->original_fancurve);
+				if (err) {
+					pr_err("Legion FanMax: Failed to read backup curve: %d\n", err);
+					mutex_unlock(&priv->fancurve_mutex);
+					return err;
+				}
+				priv->has_original_fancurve = true;
+				pr_info("Legion FanMax: Backup curve saved.\n");
+			}
+
+			// Prepare max curve
+			memcpy(&priv->fancurve_configured, &priv->original_fancurve,
+			       sizeof(struct fancurve));
+			curve = &priv->fancurve_configured;
+
+			// Overwrite all points to max speed (Raw 0xFF)
+			// Bypassing fancurve_set_speed_pwm to avoid scaling logic
+			for (i = 0; i < curve->size; i++) {
+				curve->points[i].speed1 = 0xFF;
+				curve->points[i].speed2 = 0xFF;
+				// Also force temperatures low to trigger higher tiers immediately if needed
+				// But we are setting ALL points to max, so temp shouldn't matter.
+			}
+			pr_info("Legion FanMax: Max speed values (0xFF) prepared.\n");
+
+			err = write_fancurve(priv, curve, true);
+			if (err)
+				pr_err("Legion FanMax: Failed to write max curve: %d\n", err);
+			else
+				pr_info("Legion FanMax: Max curve written successfully.\n");
+		} else {
+			// Restore backup
+			if (priv->has_original_fancurve) {
+				pr_info("Legion FanMax: Restoring original curve.\n");
+				err = write_fancurve(priv, &priv->original_fancurve, true);
+				if (err)
+					pr_err("Legion FanMax: Failed to restore curve: %d\n", err);
+				else
+					pr_info("Legion FanMax: Backup curve restored.\n");
+				// Keep has_original_fancurve true or reset? 
+				// Resetting so we get fresh backup next time
+				priv->has_original_fancurve = false;
+			} else {
+				pr_info("Legion FanMax: No backup to restore.\n");
+				err = 0;
+			}
+		}
+		mutex_unlock(&priv->fancurve_mutex);
+		return err;
+
 	case ACCESS_METHOD_WMI:
 		return wmi_write_fanfullspeed(priv, state);
 	default:
@@ -3580,8 +3638,18 @@ wmi_to_ec_powermode(enum legion_wmi_powermode wmi_mode)
 
 static ssize_t ec_read_powermode(struct legion_private *priv, int *powermode)
 {
+	int i;
 	*powermode =
 		ecram_read(&priv->ecram, priv->conf->registers->EXT_POWERMODE);
+
+	pr_info("ec_read_powermode scan 0xC400-0xC6FF:\n");
+	for (i = 0xC400; i < 0xC700; i++) {
+		u8 val = ecram_read(&priv->ecram, i);
+		if (val != 0) {
+			pr_info("  reg 0x%x = 0x%x\n", i, val);
+		}
+	}
+
 	return 0;
 }
 
@@ -4750,6 +4818,59 @@ static ssize_t powermode_store(struct device *dev,
 
 static DEVICE_ATTR_RW(powermode);
 
+static int debug_ec_addr = 0;
+
+static ssize_t debug_ec_addr_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	return sprintf(buf, "0x%x\n", debug_ec_addr);
+}
+
+static ssize_t debug_ec_addr_store(struct device *dev,
+				   struct device_attribute *attr,
+				   const char *buf, size_t count)
+{
+	int err;
+	long val;
+
+	err = kstrtol(buf, 0, &val);
+	if (err)
+		return err;
+
+	debug_ec_addr = val;
+	return count;
+}
+
+static ssize_t debug_ec_val_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct legion_private *priv = dev_get_drvdata(dev);
+	int val = ecram_read(&priv->ecram, debug_ec_addr);
+	return sprintf(buf, "0x%x\n", val);
+}
+
+static ssize_t debug_ec_val_store(struct device *dev,
+				  struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct legion_private *priv = dev_get_drvdata(dev);
+	int err;
+	long val;
+
+	err = kstrtol(buf, 0, &val);
+	if (err)
+		return err;
+
+	ecram_write(&priv->ecram, debug_ec_addr, val);
+	if (err)
+		return err;
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(debug_ec_addr);
+static DEVICE_ATTR_RW(debug_ec_val);
+
 static struct attribute *legion_sysfs_attributes[] = {
 	&dev_attr_powermode.attr,
 	&dev_attr_lockfancontroller.attr,
@@ -4782,6 +4903,8 @@ static struct attribute *legion_sysfs_attributes[] = {
 	&dev_attr_issupportgpuoc.attr,
 	&dev_attr_aslcodeversion.attr,
 	&dev_attr_igpumode.attr,
+	&dev_attr_debug_ec_addr.attr,
+	&dev_attr_debug_ec_val.attr,
 	NULL
 };
 
@@ -4791,8 +4914,15 @@ static const struct attribute_group legion_attribute_group = {
 
 static int legion_sysfs_init(struct legion_private *priv)
 {
-	return device_add_group(&priv->platform_device->dev,
+	int ret;
+	pr_info("Legion Sysfs Init: starting\n");
+	ret = device_add_group(&priv->platform_device->dev,
 				&legion_attribute_group);
+	if (ret)
+		pr_err("Legion Sysfs Init: device_add_group failed: %d\n", ret);
+	else
+		pr_info("Legion Sysfs Init: success\n");
+	return ret;
 }
 
 static void legion_sysfs_exit(struct legion_private *priv)
@@ -5062,10 +5192,11 @@ static enum access_method conf_access_method_powermode;
 
 static int legion_platform_profile_probe(void *drvdata, unsigned long *choices)
 {
+	pr_info("Legion Probe: conf_has_custom=%d\n", conf_has_custom_powermode);
 	set_bit(PLATFORM_PROFILE_QUIET, choices);
 	set_bit(PLATFORM_PROFILE_BALANCED, choices);
 	set_bit(PLATFORM_PROFILE_PERFORMANCE, choices);
-	if (conf_has_custom_powermode && conf_access_method_powermode == ACCESS_METHOD_WMI) {
+	if (conf_has_custom_powermode) {
 		set_bit(PLATFORM_PROFILE_BALANCED_PERFORMANCE, choices);
 	}
 
@@ -5084,7 +5215,7 @@ static int legion_platform_profile_init(struct legion_private *priv)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
 	struct device *dev = &priv->platform_device->dev;
 #endif
-	int err;
+	// int err;
 
 	if (!enable_platformprofile) {
 		pr_info("Skipping creating platform profile support because enable_platformprofile is false\n");
