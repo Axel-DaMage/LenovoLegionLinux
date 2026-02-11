@@ -968,6 +968,27 @@ class FanCurveIO(Feature):
             entry.gpu_upper_temp = max(entry.gpu_upper_temp, entry.gpu_lower_temp)
             entry.ic_upper_temp = max(entry.ic_upper_temp, entry.ic_lower_temp)
 
+        # Sanitization: Ensure monotonicity (speed/temp should not decrease as point_id increases)
+        # and fill trailing zeros with previous max speed.
+        last_entry = None
+        for entry in fan_curve.entries:
+            if last_entry:
+                # Temperatures must be increasing or equal
+                entry.cpu_lower_temp = max(entry.cpu_lower_temp, last_entry.cpu_lower_temp)
+                entry.cpu_upper_temp = max(entry.cpu_upper_temp, last_entry.cpu_upper_temp)
+                entry.gpu_lower_temp = max(entry.gpu_lower_temp, last_entry.gpu_lower_temp)
+                entry.gpu_upper_temp = max(entry.gpu_upper_temp, last_entry.gpu_upper_temp)
+                entry.ic_lower_temp = max(entry.ic_lower_temp, last_entry.ic_lower_temp)
+                entry.ic_upper_temp = max(entry.ic_upper_temp, last_entry.ic_upper_temp)
+                
+                # Fan speeds must be increasing or equal (fix for trailing zeros)
+                if entry.fan1_speed < last_entry.fan1_speed:
+                    entry.fan1_speed = last_entry.fan1_speed
+                if entry.fan2_speed < last_entry.fan2_speed:
+                    entry.fan2_speed = last_entry.fan2_speed
+            
+            last_entry = entry
+
         # Write in reverse order (10 to 1) to satisfy monotonicity constraints of the hardware
         reversed_entries = fan_curve.entries[::-1]
         for index, entry in enumerate(reversed_entries):
