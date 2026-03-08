@@ -862,10 +862,12 @@ class LegionController:
     def on_load_from_preset(self, name=None):
         if not name or isinstance(name, bool):
             name = self.view_fancurve.preset_combobox.currentText()
-        
         log.info("Loading preset: %s", name)
         try:
             self.model.load_fancurve_from_preset(name)
+            self.update_fancurve_gui()
+            self.model.write_fancurve_to_hw()
+            self.model.read_fancurve_from_hw()
             self.update_fancurve_gui()
         except Exception as e:
             log.error("Could not load preset %s: %s", name, str(e))
@@ -1240,16 +1242,13 @@ class FanCurveTab(QWidget):
         self.preset_combobox.blockSignals(False)
 
     def update_active_profile(self, profile):
-        # Update text if it matches a preset or just set it
         profile = profile.strip().lower()
-        found = False
+        self.preset_combobox.blockSignals(True)
         for i in range(self.preset_combobox.count()):
             if profile in self.preset_combobox.itemText(i).lower():
                 self.preset_combobox.setCurrentIndex(i)
-                found = True
                 break
-        if not found:
-            self.preset_combobox.setCurrentText(profile)
+        self.preset_combobox.blockSignals(False)
 
     def init_ui(self):
         # pylint: disable=too-many-statements
@@ -1338,34 +1337,12 @@ class FanCurveTab(QWidget):
         # Preset Section
         self.preset_combobox = QComboBox(self)
         self.preset_combobox.setMinimumWidth(150)
-        self.preset_combobox.activated.connect(lambda: self.controller.on_load_from_preset())
-        # Standard dropdown is more reliable for touch/mouse
         self.preset_combobox.setEditable(False)
-        
+
         self.save_to_preset_button = QPushButton("Guardar Preajuste")
-        self.load_from_preset_button = QPushButton("Cargar Preajuste")
+        self.load_from_preset_button = QPushButton("Cargar y Aplicar")
         self.save_to_preset_button.clicked.connect(self.controller.on_save_to_preset)
         self.load_from_preset_button.clicked.connect(self.controller.on_load_from_preset)
-        
-        def update_preset_style(text):
-            text = text.lower()
-            if "quiet" in text:
-                self.preset_combobox.setStyleSheet("background-color: #00D1FF; color: white; border-radius: 4px; font-weight: bold;")
-            elif "perf" in text:
-                self.preset_combobox.setStyleSheet("background-color: #FF3131; color: white; border-radius: 4px; font-weight: bold;")
-            elif "balan" in text:
-                self.preset_combobox.setStyleSheet("background-color: white; color: black; border-radius: 4px; font-weight: bold;")
-            else:
-                self.preset_combobox.setStyleSheet("")
-
-        def on_preset_selected(text):
-            update_preset_style(text)
-            # Automatically load the preset when selected if it matches a mode
-            # or if the user explicitly wants to load it. 
-            # For "Quiet", "Balanced", "Performance", we auto-load to match hardware.
-            self.controller.on_load_from_preset(text)
-
-        self.preset_combobox.currentTextChanged.connect(on_preset_selected)
 
         self.action_layout = QGridLayout()
         self.action_layout.setColumnStretch(0, 1)
