@@ -66,7 +66,11 @@ dkms.conf
 build/
 dist/
 
-# Legiond
-extra/service/legiond/legiond
-extra/service/legiond/legiond-ctl
-extra/service/legiond/.cache/clangd
+# Debug and log files
+*.log
+debug_*.py
+test_fan_curve*.py
+dsdt.dat
+ec_monitor.log
+launch_log.txt
+gui_test.log

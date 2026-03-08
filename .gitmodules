@@ -1,7 +1,0 @@
-[submodule "deploy/lenovolegionlinux-git"]
-	path = subprojects/lenovolegionlinux-git
-	url = https://aur.archlinux.org/lenovolegionlinux-git.git
-
-[submodule "subprojects/lenovolegionlinux-dkms-git"]
-	path = subprojects/lenovolegionlinux-dkms-git
-	url = https://aur.archlinux.org/lenovolegionlinux-dkms-git.git
