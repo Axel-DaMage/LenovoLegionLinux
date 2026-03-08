@@ -1234,8 +1234,10 @@ class FanCurveTab(QWidget):
         self.refresh_graph()
 
     def set_presets(self, presets):
+        self.preset_combobox.blockSignals(True)
         self.preset_combobox.clear()
-        self.preset_combobox.addItems(["Preset 1", "Preset 2", "Preset 3"])
+        self.preset_combobox.addItems(list(presets))
+        self.preset_combobox.blockSignals(False)
 
     def update_active_profile(self, profile):
         # Update text if it matches a preset or just set it
