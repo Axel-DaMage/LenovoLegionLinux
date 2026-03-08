@@ -866,9 +866,6 @@ class LegionController:
         try:
             self.model.load_fancurve_from_preset(name)
             self.update_fancurve_gui()
-            self.model.write_fancurve_to_hw()
-            self.model.read_fancurve_from_hw()
-            self.update_fancurve_gui()
         except Exception as e:
             log.error("Could not load preset %s: %s", name, str(e))
 
@@ -887,12 +884,12 @@ class LegionController:
     def save_settings(self):
         try:
             self.model.save_settings()
-            # Save FanCurve to current preset
             if self.view_fancurve:
                 name = self.view_fancurve.preset_combobox.currentText()
                 self.model.fan_curve = self.view_fancurve.get_fancurve()
                 self.model.save_fancurve_to_preset(name)
-                log.info(f"Saved FanCurve to preset: {name}")
+                self.model.write_fancurve_to_hw()
+                log.info(f"Saved and applied FanCurve for preset: {name}")
         except PermissionError as err:
             log_error(err)
 
@@ -1340,7 +1337,7 @@ class FanCurveTab(QWidget):
         self.preset_combobox.setEditable(False)
 
         self.save_to_preset_button = QPushButton("Guardar Preajuste")
-        self.load_from_preset_button = QPushButton("Cargar y Aplicar")
+        self.load_from_preset_button = QPushButton("Cargar Preajuste")
         self.save_to_preset_button.clicked.connect(self.controller.on_save_to_preset)
         self.load_from_preset_button.clicked.connect(self.controller.on_load_from_preset)
 
