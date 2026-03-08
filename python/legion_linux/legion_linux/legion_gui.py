@@ -11,10 +11,10 @@ import time
 from typing import List, Optional
 from PyQt6 import QtGui, QtCore
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot, QRunnable, QThreadPool
-from PyQt6.QtGui import QAction, QGuiApplication
+from PyQt6.QtGui import QAction, QGuiApplication, QPainter, QPainterPath, QPen, QColor
 from PyQt6.QtWidgets import QApplication, QMainWindow, QTabWidget, QWidget, QLabel, \
     QVBoxLayout, QGridLayout, QLineEdit, QPushButton, QComboBox, QGroupBox, \
-    QCheckBox, QSystemTrayIcon, QMenu, QScrollArea, QMessageBox, QSpinBox, QTextBrowser, QHBoxLayout, QFileDialog
+    QCheckBox, QSystemTrayIcon, QMenu, QScrollArea, QMessageBox, QSpinBox, QTextBrowser, QHBoxLayout, QFileDialog, QSizePolicy, QProgressBar
 # Make it possible to run without installation
 # pylint: disable=# pylint: disable=wrong-import-position
 sys.path.insert(0, os.path.dirname(__file__) + "/..")
@@ -40,37 +40,17 @@ def get_color_mode():
     return 'unknown'
 
 # pylint: disable=too-few-public-methods
-class QtLogHandler(QtCore.QObject):
-    logBuffer = []
-    logWritten = QtCore.pyqtSignal(str)
-
-    def emit(self, msg):
-        self.logBuffer.append(msg)
-        if self.receivers(self.logWritten) > 0:
-            while self.logBuffer:
-                self.logWritten.emit(self.logBuffer.pop(0))
-
-
-class QtHandler(logging.Handler):
-    logWritten = QtCore.pyqtSignal(str)
-
-    def __init__(self, level=0) -> None:
-        super().__init__(level)
-        self.qt_obj = QtLogHandler()
-
-    def emit(self, record):
-        msg = self.format(record)
-        self.qt_obj.emit(msg)
-
 
 logging.basicConfig()
 log = logging.getLogger(legion_linux.legion.__name__)
-qt_handler = QtHandler()
-qt_handler.setFormatter(logging.Formatter(
-    "%(asctime)s - %(levelname)s: %(message)s"))
-log.addHandler(qt_handler)
 log.setLevel('INFO')
 
+
+
+
+class MonitorSignals(QtCore.QObject):
+    # cpu_temp, gpu_temp, fan1_rpm, fan2_rpm, profile, cpu_usage, ram_usage(tuple), gpu_usage(tuple)
+    statsUpdated = QtCore.pyqtSignal(object, object, object, object, str, object, object, object)
 
 
 class MonitorWorker(QRunnable):
@@ -79,6 +59,8 @@ class MonitorWorker(QRunnable):
         self.model = model
         self.running = False
         self.notification_sender = SystemNotificationSender()
+        self.signals = MonitorSignals()
+        self.system_stats = SystemStats()
 
 
     @pyqtSlot()
@@ -90,21 +72,78 @@ class MonitorWorker(QRunnable):
             diag_msgs: List[DiagnosticMsg] = []
             for mon in self.model.monitors:
                 try:
+                    # log.info(f"Running monitor: {mon}")
                     diag_msgs = diag_msgs + mon.run()
                 # pylint: disable=broad-except
                 except Exception as err:
-                    log.error(str(err))
+                    log.error(f"Error in monitor {mon}: {err}")
+            
+            # Emit stats for the Dashboard
+            try:
+                # log.info("Reading stats for dashboard...")
+                cpu_temp = float(self.model.fancurve_io.get_cpu_temp())
+                gpu_temp = float(self.model.fancurve_io.get_gpu_temp())
+                # log.info("Read temps")
+                fan1_rpm = int(self.model.fancurve_io.get_fan_1_rpm())
+                fan2_rpm = int(self.model.fancurve_io.get_fan_2_rpm())
+                # log.info("Read fans")
+                # Warning: platform_profile might be the crash source if file read fails weirdly
+                profile = str(self.model.platform_profile.get())
+                
+                # New Stats
+                cpu_usage = self.system_stats.get_cpu_usage()
+                ram_usage = self.system_stats.get_ram_usage()
+                gpu_usage = self.system_stats.get_gpu_usage()
+
+                self.signals.statsUpdated.emit(cpu_temp, gpu_temp, fan1_rpm, fan2_rpm, profile, cpu_usage, ram_usage, gpu_usage)
+            except Exception as err:
+                log.error("Error reading stats for dashboard: %s", str(err))
+            
             for msg in diag_msgs:
                 if msg.has_value and msg.filter_do_output:
-                    log.info(str(msg.msg))
-                    self.notification_sender.notify('Legion', msg.msg)
-                elif msg.has_value:
-                    log.info("FILTERED: %s", msg.msg)
-                else:
-                    log.info("FILTERED2: %s", msg.msg)
-            time.sleep(10.0)
+                     self.notification_sender.notify('Legion', msg.msg)
+            time.sleep(1.0) # Faster monitoring for the dashboard
 
         log.info("Finishing monitoring thread")
+
+
+class MinimalistSpinBox(QSpinBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.CursorShape.SizeVerCursor)
+        self.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        self.last_y = 0
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setStyleSheet("""
+            QSpinBox {
+                border: 1px solid #333;
+                border-radius: 5px;
+                padding: 2px;
+                background-color: #1a1a1a;
+                color: #eee;
+            }
+            QSpinBox:focus {
+                border: 1px solid #00c8ff;
+            }
+        """)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.last_y = event.pos().y()
+            self.setFocus()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            current_y = event.pos().y()
+            delta = self.last_y - current_y
+            # Cumulative delta to allow fine control
+            if abs(delta) >= 2:
+                steps = delta // 2
+                self.setValue(self.value() + (steps * self.singleStep()))
+                self.last_y = current_y
+        super().mouseMoveEvent(event)
+
 
 def mark_error(checkbox: QCheckBox):
     checkbox.setStyleSheet(
@@ -298,14 +337,6 @@ class BoolFeatureTrayController:
             if self.feature.exists():
                 gui_value = self.action.isChecked()
                 self.feature.set(gui_value)
-                time.sleep(0.100)
-                hw_value = self.feature.get()
-                self.action.setChecked(hw_value)
-                self.action.setDisabled(False)
-                self.action.setCheckable(True)
-            else:
-                self.action.setDisabled(True)
-                self.action.setCheckable(False)
         # pylint: disable=broad-except
         except Exception as ex:
             log_error(ex)
@@ -329,12 +360,14 @@ class BoolFeatureTrayController:
             log_error(ex)
 
 
-class PresetTrayController:
+class PresetTrayController(QtCore.QObject):
+    view_changed = QtCore.pyqtSignal(str)
     action: List[QAction]
     model: LegionModelFacade
     dependent_controllers: List
 
     def __init__(self, model: LegionModelFacade, actions: List[QAction]):
+        super().__init__()
         self.actions = actions
         self.model = model
         self.dependent_controllers = []
@@ -366,6 +399,7 @@ class PresetTrayController:
     def on_action_click(self, name):
         log.info("Setting preset %s from tray action", name)
         self.model.fancurve_write_preset_to_hw(name)
+        self.view_changed.emit(name)
 
 
 class EnumFeatureTrayController:
@@ -538,13 +572,13 @@ class HybridGsyncController:
     def update_view_from_feature(self):
         try:
             if not self.gsynchybrid_feature.exists():
-                current_val_str = 'not found'
+                current_val_str = 'no encontrado'
             else:
                 value = self.gsynchybrid_feature.get()
                 if value:
-                    current_val_str = 'current: active'
+                    current_val_str = 'actual: activo'
                 else:
-                    current_val_str = 'current: inactive'
+                    current_val_str = 'actual: inactivo'
         # pylint: disable=broad-except
         except Exception as ex:
             current_val_str = 'error'
@@ -553,9 +587,9 @@ class HybridGsyncController:
         if self.target_value is None:
             target_val_str = ''
         elif self.target_value:
-            target_val_str = '- target: active (restart required)'
+            target_val_str = '- objetivo: activo (requiere reinicio)'
         else:
-            target_val_str = '- target: inactive (restart required)'
+            target_val_str = '- objetivo: inactivo (requiere reinicio)'
         self.current_state_label.setText(
             current_val_str + ' ' + target_val_str)
 
@@ -576,27 +610,6 @@ class LegionController:
     always_on_usb_controller: BoolFeatureController
     rapid_charging_controller: BoolFeatureController
     power_mode_controller: EnumFeatureController
-    # OC/Power
-    cpu_overclock: BoolFeatureController
-    gpu_overclock: BoolFeatureController
-    cpu_longterm_power_limit_controller: IntFeatureController
-    cpu_shortterm_power_limit_controller: IntFeatureController
-    cpu_peak_power_limit_controller: IntFeatureController
-    cpu_cross_loading_power_limit_controller: IntFeatureController
-    cpu_apu_sppt_power_limit_controller: IntFeatureController
-    gpu_ctgp_power_limit_controller: IntFeatureController
-    gpu_ppab_power_limit_controller: IntFeatureController
-    gpu_temperature_limit_controller: IntFeatureController
-    # deamon and automation
-    power_profiles_deamon_service_controller: BoolFeatureController
-    lenovo_legion_laptop_support_service_controller: BoolFeatureController
-    legion_gui_autstart_controller: BoolFeatureController
-
-    close_to_tray_controller:BoolFeatureController
-    open_closed_to_tray:BoolFeatureController
-    enable_gui_monitoring_controller:BoolFeatureController
-    icon_color_mode_controller:EnumFeatureController
-
     # tray
     batteryconservation_tray_controller: BoolFeatureTrayController
     rapid_charging_tray_controller: BoolFeatureTrayController
@@ -606,24 +619,50 @@ class LegionController:
     power_mode_tray_controller: EnumFeatureTrayController
     preset_tray_controller: PresetTrayController
 
-    def __init__(self, app:QApplication, expect_hwmon=True, use_legion_cli_to_write=False):
+    def __init__(self, app:QApplication, expect_hwmon=True, use_legion_cli_to_write=False, config_dir=None):
         self.model = LegionModelFacade(
-            expect_hwmon=expect_hwmon, use_legion_cli_to_write=use_legion_cli_to_write)
+            expect_hwmon=expect_hwmon, use_legion_cli_to_write=use_legion_cli_to_write, config_dir=config_dir)
         self.app = app
+        self.view_dashboard = None
         self.view_fancurve = None
         self.view_otheroptions = None
         self.main_window = None
-        self.log_view = None
         self.tray = None
-        self.view_automation = None
         self.show_root_dialog = (not self.model.is_root_user()) and (
             not use_legion_cli_to_write)
         self.monitoring_threadpool = QThreadPool()
         self.monitoring_worker = MonitorWorker(None)
 
+        # tray
+        self.batteryconservation_tray_controller = None
+        self.rapid_charging_tray_controller = None
+        self.fnlock_tray_controller = None
+        self.touchpad_tray_controller = None
+        self.always_on_usb_tray_controller = None
+        self.power_mode_tray_controller = None
+        self.preset_tray_controller = None
+        
+        self.monitoring_threadpool = QThreadPool()
+        self.monitoring_worker = MonitorWorker(None)
+
     def init(self, read_from_hw=True):
+        print("DEBUG: LegionController.init started")
+        if not hasattr(self, 'show_root_dialog'):
+            self.show_root_dialog = False
         # connect logger output to GUI
-        qt_handler.qt_obj.logWritten.connect(self.on_new_log_msg)
+        # qt_handler.qt_obj.logWritten.connect(self.on_new_log_msg)
+
+        print("DEBUG: Setting monitoring worker model")
+        self.monitoring_worker.model = self.model
+        # Connect monitoring signals to Dashboard
+        print(f"DEBUG: view_dashboard is {self.view_dashboard}")
+        if self.view_dashboard:
+            print("DEBUG: Connecting update_stats")
+            self.monitoring_worker.signals.statsUpdated.connect(self.view_dashboard.update_stats)
+        else:
+            print("ERROR: view_dashboard is None!")
+        
+        print("DEBUG: Finished connecting statsUpdated")
 
         # fan
         self.lockfancontroller_controller = BoolFeatureController(
@@ -671,84 +710,49 @@ class LegionController:
             activate_button=self.view_otheroptions.hybrid_activate_button,
             deactivate_button=self.view_otheroptions.hybrid_deactivate_button)
 
-        # power limits
-        self.cpu_overclock = BoolFeatureController(
-            self.view_otheroptions.cpu_overclock_ckeck,
-            self.model.cpu_overclock)
-        self.gpu_overclock = BoolFeatureController(
-            self.view_otheroptions.gpu_overclock_check,
-            self.model.gpu_overclock)
-        self.cpu_longterm_power_limit_controller = IntFeatureController(
-            self.view_otheroptions.cpu_longterm_power_limit_spinbox,
-            self.model.cpu_longterm_power_limit)
-        self.cpu_shortterm_power_limit_controller = IntFeatureController(
-            self.view_otheroptions.cpu_shortterm_power_limit_spinbox,
-            self.model.cpu_shortterm_power_limit)
-        self.cpu_peak_power_limit_controller = IntFeatureController(
-            self.view_otheroptions.cpu_peak_power_limit_spinbox,
-            self.model.cpu_peak_power_limit)
-        self.cpu_cross_loading_power_limit_controller = IntFeatureController(
-            self.view_otheroptions.cpu_cross_loading_power_limit_spinbox,
-            self.model.cpu_cross_loading_power_limit)
-        self.cpu_apu_sppt_power_limit_controller = IntFeatureController(
-            self.view_otheroptions.cpu_apu_sppt_power_limit_spinbox,
-            self.model.cpu_apu_sppt_power_limit)
-        self.gpu_ctgp_power_limit_controller = IntFeatureController(
-            self.view_otheroptions.gpu_ctgp_power_limit_spinbox,
-            self.model.gpu_ctgp_power_limit)
-        self.gpu_ppab_power_limit_controller = IntFeatureController(
-            self.view_otheroptions.gpu_ppab_power_limit_spinbox,
-            self.model.gpu_ppab_power_limit)
-        self.gpu_temperature_limit_controller = IntFeatureController(
-            self.view_otheroptions.gpu_temperature_limit_spinbox,
-            self.model.gpu_temperature_limit)
 
-
-        # services and automation
-        self.power_profiles_deamon_service_controller = BoolFeatureController(
-            self.view_automation.power_profiles_deamon_service_check,
-            self.model.power_profiles_deamon_service
-        )
-        self.lenovo_legion_laptop_support_service_controller = BoolFeatureController(
-            self.view_automation.lenovo_legion_laptop_support_service_check,
-            self.model.lenovo_legion_laptop_support_service
-        )
-        self.legion_gui_autstart_controller = BoolFeatureController(
-            self.view_automation.legion_gui_autostart_check,
-            self.model.legion_gui_autostart
-        )
-        self.close_to_tray_controller = BoolFeatureController(
-            self.view_automation.close_to_tray_check,
-            self.model.app_model.close_to_tray
-        )
-        self.open_closed_to_tray = BoolFeatureController(
-            self.view_automation.open_closed_to_tray_check,
-            self.model.app_model.open_closed_to_tray
-        )
-        self.enable_gui_monitoring_controller = BoolFeatureController(
-            self.view_automation.enable_gui_monitoring_check,
-            self.model.app_model.enable_gui_monitoring
-        )
+        # settings callback
         self.model.app_model.enable_gui_monitoring.add_callback(self.on_enable_monitoring_change)
-        self.icon_color_mode_controller = EnumFeatureController(
-            self.view_automation.icon_color_mode_combobox,
-            self.model.app_model.icon_color_mode
-        )
-        self.icon_color_mode_controller.update_view_from_feature(0, True)
 
         if read_from_hw:
-            self.model.read_fancurve_from_hw()
+            print("DEBUG: Reading from hw (async)")
+            import threading
+            threading.Thread(target=self.on_read_fan_curve_from_hw, daemon=True).start()
+            # log.warning("HW Fan Curve reading DISABLED for debugging.")
+            # self.model.read_fancurve_from_hw()
             # fan controller
         # fan
         self.update_fancurve_gui()
         self.update_fan_additional_gui()
         self.update_other_gui()
         self.update_power_gui(True)
-        self.update_automation()
+        # log.warning("Initial GUI updates DISABLED for debugging.")
         self.view_fancurve.set_presets(self.model.fancurve_repo.get_names())
         self.main_window.show_root_dialog = self.show_root_dialog
+        self.start_monitoring()
+        # log.warning("Monitoring DISABLED for debugging.")
 
     def init_tray(self):
+        print("DEBUG: LegionController.init_tray started")
+        
+        # Hard disable tray to prevent Segfaults on systems with broken DBus/Tray support
+        log.warning("Tray icon disabled for stability.")
+        self.tray = None
+        return
+
+        # if not QSystemTrayIcon.isSystemTrayAvailable():
+        #      log.warning("System tray is not available. Skipping tray icon creation.")
+        #      self.tray = None
+        #      return
+
+        try:
+            self.tray = LegionTray(
+                self.main_window.icon, self.main_window, self)
+        except Exception as e:
+            log.error(f"Failed to initialize system tray: {e}")
+            self.tray = None
+            return
+
         # tray/other
         self.batteryconservation_tray_controller = BoolFeatureTrayController(
             self.tray.batteryconservation_action, self.model.battery_conservation)
@@ -767,7 +771,7 @@ class LegionController:
         set_dependent(self.batteryconservation_tray_controller,
                       self.rapid_charging_tray_controller)
         self.rapid_charging_tray_controller.update_view_from_feature()
-
+        print("DEBUG: init_tray - charging controllers initialized")
 
         self.fnlock_tray_controller = BoolFeatureTrayController(
             self.tray.fnlock_action, self.model.fn_lock)
@@ -783,7 +787,6 @@ class LegionController:
             self.tray.always_on_usb_charging_action, self.model.always_on_usb_charging)
         set_dependent(self.always_on_usb_tray_controller, self.always_on_usb_controller)
         self.always_on_usb_tray_controller.update_view_from_feature()
-
         self.power_mode_tray_controller = EnumFeatureTrayController(self.model.platform_profile,
             [self.tray.powermode1_action,
              self.tray.powermode2_action,
@@ -792,15 +795,16 @@ class LegionController:
         set_dependent(self.power_mode_tray_controller, self.power_mode_controller)
         self.power_mode_tray_controller.update_view_from_feature()
 
-        self.preset_tray_controller = PresetTrayController(self.model,
-            [self.tray.preset1_action,
-             self.tray.preset2_action,
-             self.tray.preset3_action,
-             self.tray.preset4_action,
-             self.tray.preset5_action,
-             self.tray.preset6_action,
-             self.tray.preset7_action,
-             self.tray.preset8_action])
+        try:
+            self.preset_tray_controller = PresetTrayController(self.model,
+                [self.tray.preset1_action,
+                 self.tray.preset2_action,
+                 self.tray.preset3_action])
+            
+            # Connect signals
+            self.preset_tray_controller.view_changed.connect(self.on_load_from_preset)
+        except Exception as e:
+            log.error(f"Error initializing preset controller: {e}")
 
     def update_fan_additional_gui(self):
         self.lockfancontroller_controller.update_view_from_feature()
@@ -814,44 +818,14 @@ class LegionController:
         self.batteryconservation_controller.update_view_from_feature()
         self.rapid_charging_controller.update_view_from_feature()
         self.always_on_usb_controller.update_view_from_feature()
-        self.cpu_overclock.update_view_from_feature()
-        self.gpu_overclock.update_view_from_feature()
         self.overdrive_controller.update_view_from_feature()
         self.hybrid_gsync_controller.update_view_from_feature()
 
     def update_power_gui(self, update_bounds=False):
         self.power_mode_controller.update_view_from_feature(
             0, update_items=update_bounds)
-        self.cpu_longterm_power_limit_controller.update_view_from_feature(
-            update_bounds=update_bounds)
-        self.cpu_shortterm_power_limit_controller.update_view_from_feature(
-            update_bounds=update_bounds)
-        self.cpu_peak_power_limit_controller.update_view_from_feature(
-            update_bounds=update_bounds)
-        self.cpu_cross_loading_power_limit_controller.update_view_from_feature(
-            update_bounds=update_bounds)
-        self.cpu_apu_sppt_power_limit_controller.update_view_from_feature(
-            update_bounds=update_bounds)
-        self.gpu_ctgp_power_limit_controller.update_view_from_feature(
-            update_bounds=update_bounds)
-        self.gpu_ppab_power_limit_controller.update_view_from_feature(
-            update_bounds=update_bounds)
-        self.gpu_temperature_limit_controller.update_view_from_feature(
-            update_bounds=update_bounds)
 
     def power_gui_write_to_hw(self):
-        self.cpu_longterm_power_limit_controller.update_feature_from_view(
-            False)
-        self.cpu_shortterm_power_limit_controller.update_feature_from_view(
-            False)
-        self.cpu_peak_power_limit_controller.update_feature_from_view(False)
-        self.cpu_cross_loading_power_limit_controller.update_feature_from_view(
-            False)
-        self.cpu_apu_sppt_power_limit_controller.update_feature_from_view(
-            False)
-        self.gpu_ctgp_power_limit_controller.update_feature_from_view(False)
-        self.gpu_ppab_power_limit_controller.update_feature_from_view(False)
-        self.gpu_temperature_limit_controller.update_feature_from_view(False)
         self.update_power_gui()
 
     def update_fancurve_gui(self):
@@ -859,50 +833,54 @@ class LegionController:
                                         self.model.fancurve_io.has_minifancurve(),
                                         self.model.fancurve_io.exists())
 
-    def update_automation(self):
-        self.power_profiles_deamon_service_controller.update_view_from_feature()
-        self.lenovo_legion_laptop_support_service_controller.update_view_from_feature()
-        self.close_to_tray_controller.update_view_from_feature()
-        self.open_closed_to_tray.update_view_from_feature()
-        self.legion_gui_autstart_controller.update_view_from_feature()
-        self.enable_gui_monitoring_controller.update_view_from_feature()
-        self.icon_color_mode_controller.update_view_from_feature()
+    # Removed update_automation for simplification
 
     def on_read_fan_curve_from_hw(self):
-        self.model.read_fancurve_from_hw()
-        self.update_fancurve_gui()
+        log.info("Reading fan curve from HW (background thread)...")
+        try:
+            self.model.read_fancurve_from_hw()
+            # Marshal UI update to main thread
+            from PyQt6.QtCore import QMetaObject, Qt, Q_ARG
+            # QMetaObject.invokeMethod(self.app, "processEvents", Qt.ConnectionType.QueuedConnection)
+            # Alternatively, use a signal or QTimer, but let's try to schedule the update on the main thread loop
+            # Since self is LegionController (not a QObject), we can't invoke directly on it easily if it doesn't inherit QObject
+            # But earlier code shows it does NOT inherit QObject. 
+            # However, self.view_fancurve IS a QWidget.
+            
+            QMetaObject.invokeMethod(self.view_fancurve, "update_fancurve_gui", Qt.ConnectionType.QueuedConnection)
+            log.info("Scheduled update_fancurve_gui on main thread")
+        except Exception as e:
+            log.error(f"Error reading fan curve from HW: {e}")
 
     def on_write_fan_curve_to_hw(self):
         # Debugging
-        import legion_linux.legion
-        print(f"DEBUG: legion module file: {legion_linux.legion.__file__}")
+        print("DEBUG: on_write_fan_curve_to_hw called")
+        self.model.fan_curve = self.view_fancurve.get_fancurve()
+        self.model.write_fancurve_to_hw()
+        self.model.read_fancurve_from_hw()
+        self.update_fancurve_gui()
+    def on_load_from_preset(self, name=None):
+        if not name or isinstance(name, bool):
+            name = self.view_fancurve.preset_combobox.currentText()
+        
+        log.info("Loading preset: %s", name)
         try:
-            print(f"DEBUG: Max RPM 1: {self.model.fancurve_io.get_fan_1_max_rpm()}")
+            self.model.load_fancurve_from_preset(name)
+            self.update_fancurve_gui()
         except Exception as e:
-            print(f"DEBUG: Error getting Max RPM: {e}")
+            log.error("Could not load preset %s: %s", name, str(e))
+
+    def on_save_to_preset(self, _=None):
+        name = self.view_fancurve.preset_combobox.currentText()
+        log.info("Saving preset: %s", name)
         
         self.model.fan_curve = self.view_fancurve.get_fancurve()
-        self.model.write_fancurve_to_hw()
-        self.model.read_fancurve_from_hw()
-        self.update_fancurve_gui()
-        self.model.fan_curve = self.view_fancurve.get_fancurve()
-        self.model.write_fancurve_to_hw()
-        self.model.read_fancurve_from_hw()
-        self.update_fancurve_gui()
+        try:
+            self.model.save_fancurve_to_preset(name)
+        except Exception as e:
+            log.error(f"Could not save preset {name}: {e}")
 
-    def on_load_from_preset(self):
-        name = self.view_fancurve.preset_combobox.currentText()
-        self.model.fan_curve = self.view_fancurve.get_fancurve()
-        self.model.load_fancurve_from_preset(name)
-        self.update_fancurve_gui()
 
-    def on_save_to_preset(self):
-        name = self.view_fancurve.preset_combobox.currentText()
-        self.model.fan_curve = self.view_fancurve.get_fancurve()
-        self.model.save_fancurve_to_preset(name)
-
-    def on_new_log_msg(self, msg):
-        self.log_view.log_out.insertPlainText(msg+'\n')
 
     def save_settings(self):
         try:
@@ -915,6 +893,28 @@ class LegionController:
                 log.info(f"Saved FanCurve to preset: {name}")
         except PermissionError as err:
             log_error(err)
+
+    def apply_theme(self, theme_value):
+        """Apply a theme and persist the setting."""
+        self.model.app_model.gui_theme.set(theme_value)
+        resolved = self._resolve_theme(theme_value)
+        self.app.setStyleSheet(get_stylesheet(resolved))
+        self.model.save_settings()
+
+    def _resolve_theme(self, theme_value):
+        """Resolve 'auto' to an actual dark/light value."""
+        if theme_value == 'auto':
+            detected = get_color_mode()
+            return detected if detected in ('dark', 'light') else 'dark'
+        return theme_value
+
+    def init_theme_from_settings(self):
+        """Initialize the theme combo and apply the persisted theme."""
+        theme_value = self.model.app_model.gui_theme.get()
+        if self.view_otheroptions:
+            self.view_otheroptions.set_theme_combo_value(theme_value)
+        resolved = self._resolve_theme(theme_value)
+        self.app.setStyleSheet(get_stylesheet(resolved))
 
     def app_close_and_save(self):
         self.stop_monitoring()
@@ -932,6 +932,8 @@ class LegionController:
         log.info("Starting monitoring")
         if not self.monitoring_worker.running:
             self.monitoring_worker = MonitorWorker(self.model)
+            # Reconnect signals as they were lost with the new worker
+            self.monitoring_worker.signals.statsUpdated.connect(self.view_dashboard.update_stats)
             self.monitoring_worker.running = True
             self.monitoring_threadpool.start(self.monitoring_worker)
 
@@ -941,79 +943,228 @@ class LegionController:
 
     def on_enable_monitoring_change(self, _):
         if self.model.app_model.enable_gui_monitoring.get():
-            self.start_monitoring()
+            # self.start_monitoring()
+            log.warning("Monitoring callback DISABLED for debugging.")
         else:
             self.stop_monitoring()
 
 
-class FanCurveEntryView():
-    def __init__(self, point_id, layout):
+class FanCurveEntryView(QtCore.QObject):
+    tempChanged = QtCore.pyqtSignal(int, int) # point_id, new_temp_index (0=cpu, 1=gpu, 2=ic)
+    
+    # Predefined discrete values as requested
+    RPM_VALUES = [0, 500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500]
+    TEMP_VALUES = [0, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+
+    def __init__(self, point_id, layout, parent_tab):
+        super().__init__()
+        self.point_id = point_id
+        self.parent_tab = parent_tab
         self.point_id_label = QLabel(f'{point_id}')
         self.point_id_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.fan_speed1_edit = QLineEdit()
-        self.fan_speed2_edit = QLineEdit()
-        self.cpu_lower_temp_edit = QLineEdit()
-        self.cpu_upper_temp_edit = QLineEdit()
-        self.gpu_lower_temp_edit = QLineEdit()
-        self.gpu_upper_temp_edit = QLineEdit()
-        self.ic_lower_temp_edit = QLineEdit()
-        self.ic_upper_temp_edit = QLineEdit()
-        self.accel_edit = QLineEdit()
-        self.decel_edit = QLineEdit()
+        self.point_id_label.setStyleSheet("font-weight: bold; color: #aaa;")
+        
+        self.fan_speed1_combo = self._create_combo(self.RPM_VALUES)
+        self.fan_speed2_combo = self._create_combo(self.RPM_VALUES)
+        self.cpu_temp_combo = self._create_combo(self.TEMP_VALUES)
+        self.gpu_temp_combo = self._create_combo(self.TEMP_VALUES)
+        self.ic_temp_combo = self._create_combo(self.TEMP_VALUES)
 
-        layout.addWidget(self.point_id_label, 0, point_id)
-        layout.addWidget(self.fan_speed1_edit, 1, point_id)
-        layout.addWidget(self.fan_speed2_edit, 2, point_id)
-        layout.addWidget(self.cpu_lower_temp_edit, 3, point_id)
-        layout.addWidget(self.cpu_upper_temp_edit, 4, point_id)
-        layout.addWidget(self.gpu_lower_temp_edit, 5, point_id)
-        layout.addWidget(self.gpu_upper_temp_edit, 6, point_id)
-        layout.addWidget(self.ic_lower_temp_edit, 7, point_id)
-        layout.addWidget(self.ic_upper_temp_edit, 8, point_id)
-        layout.addWidget(self.accel_edit, 9, point_id)
-        layout.addWidget(self.decel_edit, 10, point_id)
+        layout.addWidget(self.point_id_label, 1, point_id)
+        layout.addWidget(self.fan_speed1_combo, 2, point_id)
+        layout.addWidget(self.fan_speed2_combo, 3, point_id)
+        layout.addWidget(self.cpu_temp_combo, 4, point_id)
+        layout.addWidget(self.gpu_temp_combo, 5, point_id)
+        layout.addWidget(self.ic_temp_combo, 6, point_id)
+
+    def _create_combo(self, values):
+        combo = QComboBox()
+        combo.addItems([str(v) for v in values])
+        combo.setEditable(False) # Strict selection only
+        # Connect signal
+        combo.currentIndexChanged.connect(self.on_value_changed)
+        # Style to look minimal but clear
+        combo.setStyleSheet("""
+            QComboBox {
+                background-color: #2b2b2b;
+                color: #e0e0e0;
+                border: 1px solid #3d3d3d;
+                border-radius: 4px;
+                padding: 2px;
+            }
+            QComboBox::drop-down {
+                border: 0px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #2b2b2b;
+                selection-background-color: #444;
+                color: #e0e0e0;
+            }
+        """)
+        return combo
+
+    def on_value_changed(self):
+        self.parent_tab.refresh_graph()
+
+    def _set_combo_value(self, combo, value, values_list):
+        # Find closest value in list to handle legacy data or mismatches
+        closest_val = min(values_list, key=lambda x: abs(x - value))
+        try:
+            index = values_list.index(closest_val)
+            combo.setCurrentIndex(index)
+        except ValueError:
+             combo.setCurrentIndex(0)
+
+    def _get_combo_value(self, combo):
+        try:
+            return int(combo.currentText())
+        except ValueError:
+            return 0
 
     def set(self, entry: FanCurveEntry):
-        self.fan_speed1_edit.setText(str(int(entry.fan1_speed)))
-        self.fan_speed2_edit.setText(str(int(entry.fan2_speed)))
-        self.cpu_lower_temp_edit.setText(str(entry.cpu_lower_temp))
-        self.cpu_upper_temp_edit.setText(str(entry.cpu_upper_temp))
-        self.gpu_lower_temp_edit.setText(str(entry.gpu_lower_temp))
-        self.gpu_upper_temp_edit.setText(str(entry.gpu_upper_temp))
-        self.ic_lower_temp_edit.setText(str(entry.ic_lower_temp))
-        self.ic_upper_temp_edit.setText(str(entry.ic_upper_temp))
-        self.accel_edit.setText(str(entry.acceleration))
-        self.decel_edit.setText(str(entry.deceleration))
+        # Block signals during batch update to prevent flicker
+        self.fan_speed1_combo.blockSignals(True)
+        self.fan_speed2_combo.blockSignals(True)
+        self.cpu_temp_combo.blockSignals(True)
+        self.gpu_temp_combo.blockSignals(True)
+        self.ic_temp_combo.blockSignals(True)
+        
+        self._set_combo_value(self.fan_speed1_combo, int(entry.fan1_speed), self.RPM_VALUES)
+        self._set_combo_value(self.fan_speed2_combo, int(entry.fan2_speed), self.RPM_VALUES)
+        self._set_combo_value(self.cpu_temp_combo, int(entry.cpu_upper_temp), self.TEMP_VALUES)
+        self._set_combo_value(self.gpu_temp_combo, int(entry.gpu_upper_temp), self.TEMP_VALUES)
+        self._set_combo_value(self.ic_temp_combo, int(entry.ic_upper_temp), self.TEMP_VALUES)
+        
+        self.fan_speed1_combo.blockSignals(False)
+        self.fan_speed2_combo.blockSignals(False)
+        self.cpu_temp_combo.blockSignals(False)
+        self.gpu_temp_combo.blockSignals(False)
+        self.ic_temp_combo.blockSignals(False)
 
     def set_disabled(self, value: bool):
-        self.fan_speed1_edit.setDisabled(value)
-        self.fan_speed2_edit.setDisabled(value)
-        self.cpu_lower_temp_edit.setDisabled(value)
-        self.cpu_upper_temp_edit.setDisabled(value)
-        self.gpu_lower_temp_edit.setDisabled(value)
-        self.gpu_upper_temp_edit.setDisabled(value)
-        self.ic_lower_temp_edit.setDisabled(value)
-        self.ic_upper_temp_edit.setDisabled(value)
-        self.accel_edit.setDisabled(value)
-        self.decel_edit.setDisabled(value)
+        self.fan_speed1_combo.setDisabled(value)
+        self.fan_speed2_combo.setDisabled(value)
+        self.cpu_temp_combo.setDisabled(value)
+        self.gpu_temp_combo.setDisabled(value)
+        self.ic_temp_combo.setDisabled(value)
 
     def get(self) -> FanCurveEntry:
-        fan1_speed = float(self.fan_speed1_edit.text())
-        fan2_speed = float(self.fan_speed2_edit.text())
-        cpu_lower_temp = int(self.cpu_lower_temp_edit.text())
-        cpu_upper_temp = int(self.cpu_upper_temp_edit.text())
-        gpu_lower_temp = int(self.gpu_lower_temp_edit.text())
-        gpu_upper_temp = int(self.gpu_upper_temp_edit.text())
-        ic_lower_temp = int(self.ic_lower_temp_edit.text())
-        ic_upper_temp = int(self.ic_upper_temp_edit.text())
-        acceleration = int(self.accel_edit.text())
-        deceleration = int(self.decel_edit.text())
-        entry = FanCurveEntry(fan1_speed=fan1_speed, fan2_speed=fan2_speed,
-                              cpu_lower_temp=cpu_lower_temp, cpu_upper_temp=cpu_upper_temp,
-                              gpu_lower_temp=gpu_lower_temp, gpu_upper_temp=gpu_upper_temp,
-                              ic_lower_temp=ic_lower_temp, ic_upper_temp=ic_upper_temp,
-                              acceleration=acceleration, deceleration=deceleration)
-        return entry
+        return FanCurveEntry(
+            fan1_speed=self._get_combo_value(self.fan_speed1_combo),
+            fan2_speed=self._get_combo_value(self.fan_speed2_combo),
+            cpu_lower_temp=self._get_combo_value(self.cpu_temp_combo) - 5,
+            cpu_upper_temp=self._get_combo_value(self.cpu_temp_combo),
+            gpu_lower_temp=self._get_combo_value(self.gpu_temp_combo) - 5,
+            gpu_upper_temp=self._get_combo_value(self.gpu_temp_combo),
+            ic_lower_temp=self._get_combo_value(self.ic_temp_combo) - 5,
+            ic_upper_temp=self._get_combo_value(self.ic_temp_combo),
+            acceleration=self.parent_tab.global_accel_spin.value(),
+            deceleration=self.parent_tab.global_decel_spin.value()
+        )
+
+
+class FanCurveGraph(QWidget):
+    pointDragged = QtCore.pyqtSignal(int, int) # point_id (1-10), rpm
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(200)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.entries = []
+        self.points = []
+        self.dragging_idx = -1
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.update()
+
+    def update_data(self, entries):
+        self.entries = entries
+        self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            w = self.width()
+            col_w = w / 10
+            idx = int(event.pos().x() / col_w)
+            if 0 <= idx < len(self.entries):
+                self.dragging_idx = idx
+                self.update_drag(event.pos().y())
+
+    def mouseMoveEvent(self, event):
+        if self.dragging_idx != -1:
+            self.update_drag(event.pos().y())
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.dragging_idx = -1
+
+    def update_drag(self, mouse_y):
+        h = self.height()
+        y = max(0, min(h, mouse_y))
+        raw_rpm = int((1 - y / h) * 4500)
+        
+        # Snap to nearest 500 (RPM Values from FanCurveEntryView)
+        # Using a simpler logic here to avoid circular dependency import issues if class access is tricky
+        rpm_values = [0, 500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500]
+        closest_rpm = min(rpm_values, key=lambda x: abs(x - raw_rpm))
+        
+        self.pointDragged.emit(self.dragging_idx + 1, closest_rpm)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        # Background
+        painter.fillRect(self.rect(), QColor("#121212") if self.palette().window().color().lightness() < 128 else QColor("#FFFFFF"))
+        
+        # Draw Grid
+        painter.setPen(QColor(100, 100, 100, 50))
+        w, h = self.width(), self.height()
+        
+        # Horizontal lines (10 levels)
+        for i in range(11):
+            y = int(i * h / 10)
+            painter.drawLine(0, y, w, y)
+        
+        # Vertical lines (10 points)
+        for i in range(11):
+            x = int(i * w / 10)
+            painter.drawLine(x, 0, x, h)
+
+        if not self.entries:
+            return
+
+        # Draw Curves
+        # Fan 1: Cyan, Fan 2: Pink
+        self.draw_curve(painter, 1, QColor("#43D2DE"))
+        self.draw_curve(painter, 2, QColor("#E54297"))
+
+    def draw_curve(self, painter, fan_idx, color):
+        w, h = self.width(), self.height()
+        path = QPainterPath()
+        started = False
+        
+        painter.setPen(QPen(color, 2))
+        
+        # Align points with 10 columns
+        col_w = w / 10
+        
+        for i, e in enumerate(self.entries):
+            # Point alignment: center of the column
+            x = int((i + 0.5) * col_w)
+            # Y mapping: 0-4500 RPM
+            speed = e.fan1_speed if fan_idx == 1 else e.fan2_speed
+            y = h - int(speed * h / 4500)
+            
+            if not started:
+                path.moveTo(x, y)
+                started = True
+            else:
+                path.lineTo(x, y)
+            painter.drawEllipse(x-3, y-3, 6, 6)
+        
+        painter.drawPath(path)
 
 
 class FanCurveTab(QWidget):
@@ -1025,20 +1176,50 @@ class FanCurveTab(QWidget):
 
         self.controller.view_fancurve = self
 
+    @pyqtSlot()
+    def update_fancurve_gui(self):
+        self.controller.update_fancurve_gui()
+
     def set_fancurve(self, fancurve: FanCurve, has_minifancurve: bool, enabled: bool):
         self.minfancurve_check.setDisabled(not has_minifancurve)
         for i, entry in enumerate(fancurve.entries):
             self.entry_edits[i].set(entry)
             self.entry_edits[i].set_disabled(not enabled)
+        
+        # Set global accel from the first entry if available
+        if fancurve.entries:
+            self.global_accel_spin.setValue(fancurve.entries[0].acceleration)
+            self.global_decel_spin.setValue(fancurve.entries[0].deceleration)
+
         self.load_button.setDisabled(not enabled)
         self.write_button.setDisabled(not enabled)
-
-        for i, entry in enumerate(fancurve.entries):
-            self.entry_edits[i].set(entry)
         self.minfancurve_check.setChecked(fancurve.enable_minifancurve)
+        self.refresh_graph()
+
+    def refresh_graph(self):
+        fc = self.get_fancurve()
+        self.graph.update_data(fc.entries)
+
+    def on_graph_point_dragged(self, point_id, rpm):
+        idx = point_id - 1
+        if 0 <= idx < len(self.entry_edits):
+            view = self.entry_edits[idx]
+            # Block signals to prevent infinite recursion refreshing the graph
+            view.fan_speed1_combo.blockSignals(True)
+            view.fan_speed2_combo.blockSignals(True)
+            
+            view._set_combo_value(view.fan_speed1_combo, rpm, view.RPM_VALUES)
+            view._set_combo_value(view.fan_speed2_combo, rpm, view.RPM_VALUES)
+            
+            view.fan_speed1_combo.blockSignals(False)
+            view.fan_speed2_combo.blockSignals(False)
+
+            self.refresh_graph()
 
     def get_fancurve(self) -> FanCurve:
         entries = []
+        g_accel = self.global_accel_spin.value()
+        g_decel = self.global_decel_spin.value()
         for i in range(10):
             entry = self.entry_edits[i].get()
             entries.append(entry)
@@ -1046,88 +1227,172 @@ class FanCurveTab(QWidget):
                         enable_minifancurve=self.minfancurve_check.isChecked())
 
     def create_fancurve_entry_view(self, layout, point_id):
-        self.entry_edits.append(FanCurveEntryView(point_id, layout))
+        view = FanCurveEntryView(point_id, layout, self)
+        self.entry_edits.append(view)
+
+    def on_temp_changed(self, point_id, temp_type):
+        self.refresh_graph()
 
     def set_presets(self, presets):
         self.preset_combobox.clear()
-        for preset in presets:
-            self.preset_combobox.addItem(preset)
+        self.preset_combobox.addItems(["Preset 1", "Preset 2", "Preset 3"])
+
+    def update_active_profile(self, profile):
+        # Update text if it matches a preset or just set it
+        profile = profile.strip().lower()
+        found = False
+        for i in range(self.preset_combobox.count()):
+            if profile in self.preset_combobox.itemText(i).lower():
+                self.preset_combobox.setCurrentIndex(i)
+                found = True
+                break
+        if not found:
+            self.preset_combobox.setCurrentText(profile)
 
     def init_ui(self):
         # pylint: disable=too-many-statements
-        self.fancurve_group = QGroupBox("Fan Curve")
+        self.fancurve_group = QGroupBox("Editor de Curva de Ventiladores")
         self.layout = QGridLayout()
-        self.point_id_label = QLabel("Point ID")
-        self.fan_speed1_label = QLabel("Fan 1 Speed [rpm]")
-        self.fan_speed2_label = QLabel("Fan 2 Speed [rpm]")
-        self.cpu_lower_temp_label = QLabel("CPU Lower Temp. [°C]")
-        self.cpu_upper_temp_label = QLabel("CPU Upper Temp. [°C]")
-        self.gpu_lower_temp_label = QLabel("GPU Lower Temp. [°C]")
-        self.gpu_upper_temp_label = QLabel("GPU Upper Temp. [°C]")
-        self.ic_lower_temp_label = QLabel("IC Lower Temp. [°C]")
-        self.ic_upper_temp_label = QLabel("IC Upper Temp. [°C]")
-        self.accel_label = QLabel("Acceleration  Time [s]")
-        self.decel_label = QLabel("Deceleration Time [s]")
-        self.minfancurve_check = QCheckBox("Minifancurve if too cold")
+        
+        # Add Graph in the grid spanning 10 columns
+        self.graph = FanCurveGraph()
+        self.graph.pointDragged.connect(self.on_graph_point_dragged)
+        self.layout.addWidget(self.graph, 0, 1, 1, 10)
+        # log.warning("FanCurveGraph DISABLED for debugging.")
+        
+        self.point_id_label = QLabel("Punto")
+        self.fan_speed1_label = QLabel("Ventilador 1 [rpm]")
+        self.fan_speed2_label = QLabel("Ventilador 2 [rpm]")
+        self.cpu_temp_label = QLabel("Temp. CPU [°C]")
+        self.gpu_temp_label = QLabel("Temp. GPU [°C]")
+        self.ic_temp_label = QLabel("Temp. IC [°C]")
+        
+        self.global_accel_label = QLabel("Aceleración Global [s]")
+        self.global_accel_spin = MinimalistSpinBox()
+        self.global_accel_spin.setRange(1, 10)
+        
+        self.global_decel_label = QLabel("Desaceleración Global [s]")
+        self.global_decel_spin = MinimalistSpinBox()
+        self.global_decel_spin.setRange(1, 10)
+
+        self.minfancurve_check = QCheckBox("Apagar ventiladores si está frío")
         self.lockfancontroller_check = QCheckBox(
-            "Lock fan controller, lock temperature sensors, and lock current fan speed")
+            "Bloquear controlador, sensores y velocidad actual")
         self.maximumfanspeed_check = QCheckBox(
-            "Set speed to maximum fan speed (often only in custom power mode possible)")
-        self.layout.addWidget(self.point_id_label, 0, 0)
-        self.layout.addWidget(self.fan_speed1_label, 1, 0)
-        self.layout.addWidget(self.fan_speed2_label, 2, 0)
-        self.layout.addWidget(self.cpu_lower_temp_label, 3, 0)
-        self.layout.addWidget(self.cpu_upper_temp_label, 4, 0)
-        self.layout.addWidget(self.gpu_lower_temp_label, 5, 0)
-        self.layout.addWidget(self.gpu_upper_temp_label, 6, 0)
-        self.layout.addWidget(self.ic_lower_temp_label, 7, 0)
-        self.layout.addWidget(self.ic_upper_temp_label, 8, 0)
-        self.layout.addWidget(self.accel_label, 9, 0)
-        self.layout.addWidget(self.decel_label, 10, 0)
-        self.layout.addWidget(self.minfancurve_check, 11, 0, 1, 10)
-        self.layout.addWidget(self.lockfancontroller_check, 12, 0, 1, 10)
-        self.layout.addWidget(self.maximumfanspeed_check, 13, 0, 1, 10)
+            "Forzar Velocidad Máxima")
+        
+        # Labels column
+        self.layout.addWidget(self.point_id_label, 1, 0)
+        self.layout.addWidget(self.fan_speed1_label, 2, 0)
+        self.layout.addWidget(self.fan_speed2_label, 3, 0)
+        self.layout.addWidget(self.cpu_temp_label, 4, 0)
+        self.layout.addWidget(self.gpu_temp_label, 5, 0)
+        self.layout.addWidget(self.ic_temp_label, 6, 0)
+        
+        # Set column stretch for 100% width
+        self.layout.setColumnStretch(0, 0) # Label column
+        for i in range(1, 11):
+            self.layout.setColumnStretch(i, 1) # Points columns
+
         for i in range(1, 11):
             self.create_fancurve_entry_view(self.layout, i)
-        self.fancurve_group.setLayout(self.layout)
+        
+        # Unified Controls
+        self.extra_options_layout = QHBoxLayout()
+        self.extra_options_layout.addWidget(self.global_accel_label)
+        self.extra_options_layout.addWidget(self.global_accel_spin)
+        self.extra_options_layout.addWidget(self.global_decel_label)
+        self.extra_options_layout.addWidget(self.global_decel_spin)
+        self.extra_options_layout.addStretch()
 
-        self.button1_group = QGroupBox("Fancurve Hardware")
-        self.button1_layout = QGridLayout()
+        self.main_fancurve_layout = QVBoxLayout()
 
-        self.load_button = QPushButton("Read from HW")
-        self.write_button = QPushButton("Apply to HW")
-        self.note_label = QLabel(
-            "Fan curve is reset to default if you toggle power mode (Fn + Q).")
-        self.load_button.clicked.connect(
-            self.controller.on_read_fan_curve_from_hw)
-        self.write_button.clicked.connect(
-            self.controller.on_write_fan_curve_to_hw)
-        self.button1_group.setLayout(self.button1_layout)
-        self.button1_layout.addWidget(self.load_button, 0, 0)
-        self.button1_layout.addWidget(self.write_button, 0, 1)
-        self.button1_layout.addWidget(self.note_label, 1, 0)
+        self.main_fancurve_layout.addLayout(self.layout)
+        
+        # Merge Extra Options and Checkboxes into a compact layout
+        self.config_row = QHBoxLayout()
+        self.config_row.addWidget(self.global_accel_label)
+        self.config_row.addWidget(self.global_accel_spin)
+        self.config_row.addWidget(self.global_decel_label)
+        self.config_row.addWidget(self.global_decel_spin)
+        self.config_row.addSpacing(20)
+        self.config_row.addWidget(self.minfancurve_check)
+        self.config_row.addWidget(self.lockfancontroller_check)
+        self.config_row.addWidget(self.maximumfanspeed_check)
+        self.config_row.addStretch()
+        
+        self.main_fancurve_layout.addLayout(self.config_row)
+        self.fancurve_group.setLayout(self.main_fancurve_layout)
 
-        self.button2_group = QGroupBox("Fancurve Preset")
-        self.button2_layout = QGridLayout()
-        self.save_to_preset_button = QPushButton("Save to Preset")
-        self.load_from_preset_button = QPushButton("Load from Preset")
-        self.save_to_preset_button.clicked.connect(
-            self.controller.on_save_to_preset)
-        self.load_from_preset_button.clicked.connect(
-            self.controller.on_load_from_preset)
+        # Merge Hardware and Preset into one horizontal "Action Row"
+        self.action_group = QGroupBox("Hardware y Preajustes")
+        
+        # HW Section
+        self.load_button = QPushButton("Leer HW")
+        self.write_button = QPushButton("Aplicar HW")
+        self.load_button.clicked.connect(self.controller.on_read_fan_curve_from_hw)
+        self.write_button.clicked.connect(self.controller.on_write_fan_curve_to_hw)
+        
+        # Preset Section
         self.preset_combobox = QComboBox(self)
-        self.button2_group.setLayout(self.button2_layout)
-        self.button2_layout.addWidget(self.preset_combobox, 0, 0)
-        self.button2_layout.addWidget(self.save_to_preset_button, 1, 0)
-        self.button2_layout.addWidget(self.load_from_preset_button, 1, 1)
+        self.preset_combobox.setMinimumWidth(150)
+        self.preset_combobox.activated.connect(lambda: self.controller.on_load_from_preset())
+        # Standard dropdown is more reliable for touch/mouse
+        self.preset_combobox.setEditable(False)
+        
+        self.save_to_preset_button = QPushButton("Guardar Preajuste")
+        self.load_from_preset_button = QPushButton("Cargar Preajuste")
+        self.save_to_preset_button.clicked.connect(self.controller.on_save_to_preset)
+        self.load_from_preset_button.clicked.connect(self.controller.on_load_from_preset)
+        
+        def update_preset_style(text):
+            text = text.lower()
+            if "quiet" in text:
+                self.preset_combobox.setStyleSheet("background-color: #00D1FF; color: white; border-radius: 4px; font-weight: bold;")
+            elif "perf" in text:
+                self.preset_combobox.setStyleSheet("background-color: #FF3131; color: white; border-radius: 4px; font-weight: bold;")
+            elif "balan" in text:
+                self.preset_combobox.setStyleSheet("background-color: white; color: black; border-radius: 4px; font-weight: bold;")
+            else:
+                self.preset_combobox.setStyleSheet("")
+
+        def on_preset_selected(text):
+            update_preset_style(text)
+            # Automatically load the preset when selected if it matches a mode
+            # or if the user explicitly wants to load it. 
+            # For "Quiet", "Balanced", "Performance", we auto-load to match hardware.
+            self.controller.on_load_from_preset(text)
+
+        self.preset_combobox.currentTextChanged.connect(on_preset_selected)
+
+        self.action_layout = QGridLayout()
+        self.action_layout.setColumnStretch(0, 1)
+        self.action_layout.setColumnStretch(1, 0) # Middle item
+        self.action_layout.setColumnStretch(2, 1)
+        
+        # Left buttons container
+        self.left_actions = QHBoxLayout()
+        self.left_actions.addStretch()
+        self.left_actions.addWidget(self.load_button)
+        self.left_actions.addWidget(self.write_button)
+        
+        # Right buttons container
+        self.right_actions = QHBoxLayout()
+        self.right_actions.addWidget(self.save_to_preset_button)
+        self.right_actions.addWidget(self.load_from_preset_button)
+        self.right_actions.addStretch()
+
+        self.action_layout.addLayout(self.left_actions, 0, 0)
+        self.action_layout.addWidget(self.preset_combobox, 0, 1, Qt.AlignmentFlag.AlignCenter)
+        self.action_layout.addLayout(self.right_actions, 0, 2)
+        
+        self.action_group.setLayout(self.action_layout)
 
         self.main_layout = QVBoxLayout()
-        self.main_layout.addWidget(self.fancurve_group, 0)
-        self.main_layout.addWidget(self.button1_group, 1)
-        self.main_layout.addWidget(self.button2_group, 2)
-
-
-
+        self.main_layout.addWidget(self.fancurve_group, 1) # Give more space to editor
+        self.main_layout.addWidget(self.action_group, 0)
+        self.main_layout.addWidget(QLabel("La curva de ventiladores se reinicia al cambiar el modo de energía (Fn + Q)."), 0)
+        
         self.setLayout(self.main_layout)
 
 
@@ -1135,275 +1400,426 @@ class OtherOptionsTab(QWidget):
     def __init__(self, controller: LegionController):
         super().__init__()
         self.controller = controller
-        self.init_power_ui()
         self.init_ui()
         self.controller.view_otheroptions = self
 
     def init_ui(self):
-        self.options_group = QGroupBox("Options")
-        self.options_layout = QVBoxLayout()
-        self.options_group.setLayout(self.options_layout)
-
-        self.fnlock_check = QCheckBox(
-            "Fn Lock (Use special function of F1-F12 keys without pressing Fn; same as Fn + Esc)")
-        self.options_layout.addWidget(self.fnlock_check, 0)
-
-        self.winkey_check = QCheckBox(
-            "Win Key Enabled")
-        self.options_layout.addWidget(self.winkey_check, 0)
-
-        self.touchpad_check = QCheckBox(
-            "Touchpad Enabled (Lock or unlock touchpad; same as Fn + F10)")
-        self.options_layout.addWidget(self.touchpad_check, 1)
-
-        self.camera_power_check = QCheckBox(
-            "Camera Power Enabled")
-        self.options_layout.addWidget(self.camera_power_check, 0)
-
-        self.batteryconservation_check = QCheckBox(
-            "Battery Conservation (keep battery at about 50 percent and do not charge on AC to extend battery life)")
-        self.options_layout.addWidget(self.batteryconservation_check, 2)
-
-        self.rapid_charging_check = QCheckBox(
-            "Rapid Charging")
-        self.options_layout.addWidget(self.rapid_charging_check, 3)
-
-        self.always_on_usb_check = QCheckBox(
-            "Charge Output from USB always on")
-        self.options_layout.addWidget(self.always_on_usb_check, 4)
-
-        self.overdrive_check = QCheckBox(
-            "Display Overdrive Enabled")
-        self.options_layout.addWidget(self.overdrive_check, 5)
-
-
-        self.hybrid_label = QLabel('Hybrid Mode (sometimes also GSync):')
-        self.hybrid_state_label = QLabel('')
-        self.hybrid_activate_button = QPushButton('Activate')
-        self.hybrid_deactivate_button = QPushButton('Deactivate')
-        self.hybrid_layout = QHBoxLayout()
-        self.hybrid_layout.addWidget(self.hybrid_label)
-        self.hybrid_layout.addWidget(self.hybrid_activate_button)
-        self.hybrid_layout.addWidget(self.hybrid_deactivate_button)
-        self.hybrid_layout.addWidget(self.hybrid_state_label)
-
-        self.options_layout.addLayout(self.hybrid_layout, 6)
-
         self.main_layout = QVBoxLayout()
-        self.main_layout.addWidget(self.options_group, 0)
-        self.main_layout.addWidget(self.power_group, 1)
+        self.main_layout.setSpacing(15)
+
+        # --- Hidden widgets (still needed by controllers, but not displayed) ---
+        # General Settings controls: kept for BoolFeatureController compatibility
+        self.fnlock_check = QCheckBox("Bloqueo Fn (Teclas Fn sin presionar Fn)")
+        self.touchpad_check = QCheckBox("Touchpad Habilitado")
+        self.camera_power_check = QCheckBox("Cámara Habilitada")
+        self.winkey_check = QCheckBox("Tecla Win Habilitada")
+
+        # System Performance controls: user uses Fn+Q instead
+        self.power_mode_label = QLabel("Modo de Energía / Perfil:")
+        self.power_mode_combo = QComboBox()
+        self.power_load_button = QPushButton("Leer de HW")
+        self.power_write_button = QPushButton("Aplicar a HW")
+        self.power_load_button.clicked.connect(self.controller.update_power_gui)
+        self.power_write_button.clicked.connect(self.controller.power_gui_write_to_hw)
+
+        # --- 1. Power & Battery ---
+        self.battery_group = QGroupBox("Energía y Batería")
+        battery_layout = QGridLayout()
+        battery_layout.setColumnStretch(0, 1)
+        battery_layout.setColumnStretch(1, 1)
+
+        self.rapid_charging_check = QCheckBox("Carga Rápida")
+        self.batteryconservation_check = QCheckBox("Conservación de Batería (Límite 60%)")
+        self.always_on_usb_check = QCheckBox("Carga USB Siempre Activa")
+
+        battery_layout.addWidget(self.rapid_charging_check, 0, 0, Qt.AlignmentFlag.AlignCenter)
+        battery_layout.addWidget(self.batteryconservation_check, 0, 1, Qt.AlignmentFlag.AlignCenter)
+        battery_layout.addWidget(self.always_on_usb_check, 1, 0, 1, 2, Qt.AlignmentFlag.AlignCenter)
+        self.battery_group.setLayout(battery_layout)
+
+        # --- 2. Display & Graphics ---
+        self.display_group = QGroupBox("Pantalla y Gráficos")
+        display_layout = QVBoxLayout()
+
+        self.overdrive_check = QCheckBox("Overdrive de Pantalla (Menor Tiempo de Respuesta)")
+        
+        self.hybrid_label = QLabel("Modo Híbrido:")
+        self.hybrid_state_label = QLabel("")
+        self.hybrid_activate_button = QPushButton("Activar")
+        self.hybrid_deactivate_button = QPushButton("Desactivar")
+
+        hybrid_container = QHBoxLayout()
+        hybrid_container.addStretch()
+        hybrid_container.addWidget(self.hybrid_label)
+        hybrid_container.addWidget(self.hybrid_activate_button)
+        hybrid_container.addWidget(self.hybrid_deactivate_button)
+        hybrid_container.addWidget(self.hybrid_state_label)
+        hybrid_container.addStretch()
+
+        overdrive_container = QHBoxLayout()
+        overdrive_container.addStretch()
+        overdrive_container.addWidget(self.overdrive_check)
+        overdrive_container.addStretch()
+
+        display_layout.addLayout(overdrive_container)
+        display_layout.addLayout(hybrid_container)
+        self.display_group.setLayout(display_layout)
+
+        # --- 3. Appearance ---
+        self.appearance_group = QGroupBox("Apariencia")
+        appearance_layout = QHBoxLayout()
+        appearance_layout.addStretch()
+
+        self.theme_label = QLabel("Tema:")
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItem("Auto (Sistema)", "auto")
+        self.theme_combo.addItem("Oscuro", "dark")
+        self.theme_combo.addItem("Claro", "light")
+        self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
+
+        appearance_layout.addWidget(self.theme_label)
+        appearance_layout.addWidget(self.theme_combo)
+        appearance_layout.addStretch()
+        self.appearance_group.setLayout(appearance_layout)
+
+        # Add visible groups to main layout, centered
+        self.main_layout.addStretch()
+        self.main_layout.addWidget(self.battery_group)
+        self.main_layout.addWidget(self.display_group)
+        self.main_layout.addWidget(self.appearance_group)
         self.main_layout.addStretch()
         self.setLayout(self.main_layout)
 
-        self.bootlogo_group = QGroupBox("Boot Logo")
-        self.bootlogo_layout = QVBoxLayout()
-        self.bootlogo_group.setLayout(self.bootlogo_layout)
-        self.bootlogo_checkbox = QCheckBox("Enable Boot Logo")
-        self.bootlogo_checkbox.clicked.connect(self.on_bootlogo_toggled)
-        self.bootlogo_layout.addWidget(self.bootlogo_checkbox)
-        self.select_image_btn = QPushButton("Select Image")
-        self.select_image_btn.clicked.connect(self.on_select_image)
-        self.bootlogo_layout.addWidget(self.select_image_btn)
-        self.main_layout.addWidget(self.bootlogo_group)
-        self.update_bootlogo_view()
+    def set_theme_combo_value(self, theme_value):
+        """Set the combo box to match a theme value without triggering the change signal."""
+        self.theme_combo.blockSignals(True)
+        for i in range(self.theme_combo.count()):
+            if self.theme_combo.itemData(i) == theme_value:
+                self.theme_combo.setCurrentIndex(i)
+                break
+        self.theme_combo.blockSignals(False)
 
-    def update_bootlogo_view(self):
-        is_on, w, h = self.controller.model.get_boot_logo_status()
-        self.bootlogo_checkbox.setChecked(is_on)
+    def _on_theme_changed(self, index):
+        theme_value = self.theme_combo.itemData(index)
+        if theme_value and self.controller:
+            self.controller.apply_theme(theme_value)
 
-    def on_bootlogo_toggled(self):
-        if self.bootlogo_checkbox.isChecked():
-            self.on_select_image()
+
+
+
+
+# --- Enhanced Dashboard Components ---
+
+class AnimatedProgressBar(QProgressBar):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.animation = QtCore.QPropertyAnimation(self, b"value")
+        self.animation.setDuration(1200) # Slower smooth transition
+        self.animation.setEasingCurve(QtCore.QEasingCurve.Type.InOutCubic)
+
+    def setValueSmooth(self, value):
+        if self.value() != value:
+            self.animation.stop()
+            self.animation.setStartValue(self.value())
+            self.animation.setEndValue(value)
+            self.animation.start()
         else:
-            try:
-                self.controller.model.restore_boot_logo()
-                QMessageBox.information(self, "Success", "Boot Logo restored.")
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Restore failed: {e}")
-            self.update_bootlogo_view()
-
-    def on_select_image(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select Image", "", "Images (*.png *.jpg *.bmp)")
-        if path:
-            try:
-                self.controller.model.enable_boot_logo(path)
-                QMessageBox.information(self, "Success", f"Boot Logo enabled with {path}.")
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Enable failed: {e}")
-                self.bootlogo_checkbox.setChecked(False)
-            self.update_bootlogo_view()
-
-    def init_power_ui(self):
-        # pylint: disable=too-many-statements
-        self.power_group = QGroupBox("Power Options")
-        self.power_all_layout = QVBoxLayout()
-        self.power_group.setLayout(self.power_all_layout)
-
-        self.power_layout = QGridLayout()
-        self.power_all_layout.addLayout(self.power_layout, 0)
-
-        self.power_mode_label = QLabel(
-            'Power mode/platform profile:')
-        self.power_mode_combo = QComboBox()
-        self.power_layout.addWidget(self.power_mode_label, 0, 0)
-        self.power_layout.addWidget(self.power_mode_combo, 0, 1)
-
-        self.cpu_overclock_ckeck = QCheckBox(
-            "CPU Overclock")
-        self.power_layout.addWidget(self.cpu_overclock_ckeck, 1, 0)
-
-        self.gpu_overclock_check = QCheckBox(
-            "GPU Overclock")
-        self.power_layout.addWidget(self.gpu_overclock_check, 1, 1)
-
-        self.cpu_longterm_power_limit_spinbox_label = QLabel(
-            "CPU Long Term Power Limit [W]")
-        self.cpu_longterm_power_limit_spinbox = QSpinBox()
-        self.power_layout.addWidget(
-            self.cpu_longterm_power_limit_spinbox_label, 3, 0)
-        self.power_layout.addWidget(
-            self.cpu_longterm_power_limit_spinbox, 3, 1)
-
-        self.cpu_shortterm_power_limit_spinbox_label = QLabel(
-            "CPU Short Term Power Limit [W]")
-        self.cpu_shortterm_power_limit_spinbox = QSpinBox()
-        self.power_layout.addWidget(
-            self.cpu_shortterm_power_limit_spinbox_label, 4, 0)
-        self.power_layout.addWidget(
-            self.cpu_shortterm_power_limit_spinbox, 4, 1)
-
-        self.cpu_peak_power_limit_spinbox_label = QLabel(
-            "CPU Peak Power Limit [W]")
-        self.cpu_peak_power_limit_spinbox = QSpinBox()
-        self.power_layout.addWidget(
-            self.cpu_peak_power_limit_spinbox_label, 5, 0)
-        self.power_layout.addWidget(self.cpu_peak_power_limit_spinbox, 5, 1)
-
-        self.cpu_cross_loading_power_limit_spinbox_label = QLabel(
-            "CPU Cross Loading Power Limit [W]")
-        self.cpu_cross_loading_power_limit_spinbox = QSpinBox()
-        self.power_layout.addWidget(
-            self.cpu_cross_loading_power_limit_spinbox_label, 6, 0)
-        self.power_layout.addWidget(
-            self.cpu_cross_loading_power_limit_spinbox, 6, 1)
-
-        self.cpu_apu_sppt_power_limit_spinbox_label = QLabel(
-            "CPU APU SPPT Power Limit [W]")
-        self.cpu_apu_sppt_power_limit_spinbox = QSpinBox()
-        self.power_layout.addWidget(
-            self.cpu_apu_sppt_power_limit_spinbox_label, 7, 0)
-        self.power_layout.addWidget(
-            self.cpu_apu_sppt_power_limit_spinbox, 7, 1)
-
-        self.gpu_ctgp_power_limit_spinbox_label = QLabel(
-            "GPU cTGP Power Limit [W]")
-        self.gpu_ctgp_power_limit_spinbox = QSpinBox()
-        self.power_layout.addWidget(
-            self.gpu_ctgp_power_limit_spinbox_label, 8, 0)
-        self.power_layout.addWidget(
-            self.gpu_ctgp_power_limit_spinbox, 8, 1)
-
-        self.gpu_ppab_power_limit_spinbox_label = QLabel(
-            "GPU PPAB Power Limit [W]")
-        self.gpu_ppab_power_limit_spinbox = QSpinBox()
-        self.power_layout.addWidget(
-            self.gpu_ppab_power_limit_spinbox_label, 9, 0)
-        self.power_layout.addWidget(
-            self.gpu_ppab_power_limit_spinbox, 9, 1)
-
-        self.gpu_temperature_limit_spinbox_label = QLabel(
-            "GPU Temperature Limit [°C]")
-        self.gpu_temperature_limit_spinbox = QSpinBox()
-        self.power_layout.addWidget(
-            self.gpu_temperature_limit_spinbox_label, 10, 0)
-        self.power_layout.addWidget(
-            self.gpu_temperature_limit_spinbox, 10, 1)
-
-        self.power_load_button = QPushButton("Read from HW")
-        self.power_write_button = QPushButton("Apply to HW")
-        self.power_load_button.clicked.connect(
-            self.controller.update_power_gui)
-        self.power_write_button.clicked.connect(
-            self.controller.power_gui_write_to_hw)
-        self.power_layout.addWidget(self.power_load_button, 11, 0)
-        self.power_layout.addWidget(self.power_write_button, 11, 1)
+            # If same value, ensure it renders
+            super().setValue(value)
 
 
+class SystemStats:
+    def __init__(self):
+        self.last_cpu_total = 0
+        self.last_cpu_idle = 0
+        self.init_cpu_stats()
+
+    def init_cpu_stats(self):
+        try:
+            with open('/proc/stat', 'r') as f:
+                line = f.readline()
+                parts = line.split()
+                # user, nice, system, idle, iowait, irq, softirq, steal
+                self.last_cpu_idle = float(parts[4])
+                self.last_cpu_total = sum([float(x) for x in parts[1:]])
+        except Exception:
+            pass
+
+    def get_cpu_usage(self):
+        try:
+            with open('/proc/stat', 'r') as f:
+                line = f.readline()
+                parts = line.split()
+                idle = float(parts[4])
+                total = sum([float(x) for x in parts[1:]])
+                
+                diff_idle = idle - self.last_cpu_idle
+                diff_total = total - self.last_cpu_total
+                
+                self.last_cpu_idle = idle
+                self.last_cpu_total = total
+                
+                if diff_total == 0: return 0.0
+                usage = (1.0 - diff_idle / diff_total) * 100.0
+                return round(usage, 1)
+        except Exception:
+            return 0.0
+
+    def get_ram_usage(self):
+        # Returns (percent, used_gb, total_gb)
+        try:
+            meminfo = {}
+            with open('/proc/meminfo', 'r') as f:
+                for line in f:
+                    parts = line.split(':')
+                    if len(parts) == 2:
+                        meminfo[parts[0].strip()] = int(parts[1].strip().split()[0])
+            
+            total = meminfo.get('MemTotal', 1)
+            available = meminfo.get('MemAvailable', 0)
+            used = total - available
+            percent = (used / total) * 100.0
+            return round(percent, 1), round(used / 1024 / 1024, 1), round(total / 1024 / 1024, 1)
+        except Exception:
+            return 0.0, 0.0, 0.0
+
+    def get_gpu_usage(self):
+        # Returns (usage_percent, memory_used_mb)
+        # Using nvidia-smi if available
+        try:
+            import subprocess
+            # Query utilization.gpu and memory.used
+            result = subprocess.check_output(['nvidia-smi', '--query-gpu=utilization.gpu,memory.used', '--format=csv,noheader,nounits'], encoding='utf-8')
+            parts = result.strip().split(',')
+            if len(parts) >= 2:
+                return float(parts[0]), float(parts[1])
+        except Exception:
+            pass
+        return 0.0, 0.0
 
 
-class AutomationTab(QWidget):
+class RealtimeGraph(QWidget):
+    def __init__(self, title, labels, colors, max_value=100, unit="", parent=None):
+        super().__init__(parent)
+        self.title = title
+        self.labels = labels
+        self.colors = colors # List of QColor
+        self.max_value = max_value
+        self.unit = unit
+        self.data_history = [[] for _ in range(len(labels))] # List of lists
+        self.history_size = 60 # Keep 60 points
+        self.setMinimumHeight(200)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def add_data(self, values: List[float]):
+        for i, val in enumerate(values):
+            if i < len(self.data_history):
+                self.data_history[i].append(val)
+                if len(self.data_history[i]) > self.history_size:
+                    self.data_history[i].pop(0)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        w, h = self.width(), self.height()
+        
+        # Background
+        painter.fillRect(self.rect(), QColor("#121212"))
+        
+        # Title
+        painter.setPen(QColor("#ffffff"))
+        painter.drawText(10, 20, self.title)
+
+        # Legend
+        legend_x = w - 150
+        for i, label in enumerate(self.labels):
+            painter.setPen(self.colors[i])
+            painter.drawText(legend_x, 20 + (i * 15), f"■ {label}")
+
+        # Grid & Labels
+        painter.setPen(QColor(100, 100, 100, 50))
+        
+        # Margins based on text width (approx 30px for labels)
+        left_margin = 35
+        right_margin = 10
+        top_margin = 30
+        bottom_margin = 20
+        graph_w = w - left_margin - right_margin
+        graph_h = h - top_margin - bottom_margin
+
+        # Draw 5 horizontal lines and Y-axis labels
+        painter.setFont(QtGui.QFont("Arial", 8))
+        for i in range(5):
+            y_ratio = i / 4.0
+            y = int(top_margin + y_ratio * graph_h)
+            
+            # Grid Line
+            painter.setPen(QColor(100, 100, 100, 50))
+            painter.drawLine(left_margin, y, w - right_margin, y)
+            
+            # Label
+            value = int(self.max_value * (1.0 - y_ratio))
+            painter.setPen(QColor(150, 150, 150))
+            painter.drawText(0, y + 4, 30, 20, Qt.AlignmentFlag.AlignRight, f"{value}")
+            
+        # Draw Charts
+        for i, history in enumerate(self.data_history):
+            if len(history) < 2: continue
+            
+            path = QPainterPath()
+            step_x = graph_w / (self.history_size - 1)
+            
+            # Map value 0..max to h..0 (inverted y) within graph area
+            def val_to_y(v):
+                ratio = min(v / self.max_value, 1.0)
+                return top_margin + graph_h - (ratio * graph_h)
+
+            path.moveTo(w - right_margin - ((len(history)-1) * step_x), val_to_y(history[0]))
+            
+            for j, val in enumerate(history[1:]):
+                x = w - right_margin - ((len(history) - 1 - (j+1)) * step_x)
+                y = val_to_y(val)
+                path.lineTo(x, y)
+                
+            painter.setPen(QPen(self.colors[i], 2))
+            painter.drawPath(path)
+
+class DashboardTab(QWidget):
     def __init__(self, controller: LegionController):
         super().__init__()
         self.controller = controller
         self.init_ui()
-        self.controller.view_automation = self
+        self.controller.view_dashboard = self
 
     def init_ui(self):
-        self.options_group = QGroupBox("Systemd Services")
-        self.options_layout = QVBoxLayout()
-        self.options_group.setLayout(self.options_layout)
+        self.layout = QVBoxLayout()
+        self.layout.setSpacing(20)
+        self.setLayout(self.layout)
 
-        self.power_profiles_deamon_service_check = QCheckBox(
-            "Power Profiles Daemon Enabled")
-        self.options_layout.addWidget(
-            self.power_profiles_deamon_service_check, 0)
+        # 1. Top Cards (Grid of 4)
+        self.cards_layout = QGridLayout()
+        self.cpu_card = self.create_card("Temp. CPU")
+        self.gpu_card = self.create_card("Temp. GPU")
+        self.fan1_card = self.create_card("Vent. 1 RPM")
+        self.fan2_card = self.create_card("Vent. 2 RPM")
+        
+        self.cards_layout.addWidget(self.cpu_card, 0, 0)
+        self.cards_layout.addWidget(self.gpu_card, 0, 1)
+        self.cards_layout.addWidget(self.fan1_card, 1, 0)
+        self.cards_layout.addWidget(self.fan2_card, 1, 1)
+        
+        self.layout.addLayout(self.cards_layout)
 
-        self.lenovo_legion_laptop_support_service_check = QCheckBox(
-            "Lenovo Legion Laptop Support Daemon Enabled")
-        self.options_layout.addWidget(
-            self.lenovo_legion_laptop_support_service_check, 1)
+        # 2. Charts (Side by Side)
+        self.charts_layout = QHBoxLayout()
+        
+        self.temp_graph = RealtimeGraph("Historial de Temperatura", ["CPU", "GPU"], [QColor("#007BFF"), QColor("#FF4136")], max_value=100, unit="°C")
+        self.fan_graph = RealtimeGraph("Historial de Ventiladores", ["Vent. 1", "Vent. 2"], [QColor("#00D1FF"), QColor("#E54297")], max_value=4500, unit="RPM")
+        
+        self.charts_layout.addWidget(self.temp_graph)
+        self.charts_layout.addWidget(self.fan_graph)
+        self.layout.addLayout(self.charts_layout, 1) # Give charts stretch priority
 
-        self.legion_gui_autostart_check = QCheckBox(
-            "Autostart Legion GUI on Session Startup")
-        self.options_layout.addWidget(
-            self.legion_gui_autostart_check, 1)
+        # 3. System Usage (Progress Bars)
+        self.usage_group = QGroupBox("Uso del Sistema")
+        self.usage_layout = QVBoxLayout()
+        
+        self.cpu_usage_bar = self.create_progress_bar("Uso CPU")
+        self.ram_usage_bar = self.create_progress_bar("Uso RAM")
+        self.gpu_usage_bar = self.create_progress_bar("Uso GPU")
+        
+        self.usage_layout.addWidget(self.cpu_usage_bar['container'])
+        self.usage_layout.addWidget(self.ram_usage_bar['container'])
+        self.usage_layout.addWidget(self.gpu_usage_bar['container'])
+        
+        self.usage_group.setLayout(self.usage_layout)
+        self.layout.addWidget(self.usage_group)
 
-
-        self.close_to_tray_check = QCheckBox(
-            "Close Legion GUI to Tray")
-        self.options_layout.addWidget(
-            self.close_to_tray_check, 2)
-
-        self.open_closed_to_tray_check = QCheckBox(
-            "Open Legion GUI Closed to Tray")
-        self.options_layout.addWidget(
-            self.open_closed_to_tray_check, 3)
-
-        self.icon_color_mode_label = QLabel(
-            'Icon Color Mode (requires reopening the app)')
-        self.options_layout.addWidget(
-            self.icon_color_mode_label, 3)
-        self.icon_color_mode_combobox = QComboBox()
-        self.options_layout.addWidget(
-            self.icon_color_mode_combobox, 3)
-
-        self.enable_gui_monitoring_check = QCheckBox(
-            "Enable Monitoring while GUI is Running")
-        self.options_layout.addWidget(
-            self.enable_gui_monitoring_check, 3)
-
-
-
-
-        self.main_layout = QVBoxLayout()
-        self.main_layout.addWidget(self.options_group, 0)
-        self.setLayout(self.main_layout)
-
-# pylint: disable=too-few-public-methods
-
-
-class LogTab(QWidget):
-    def __init__(self, controller):
-        super().__init__()
-        controller.log_view = self
-        self.init_ui()
-
-    def init_ui(self):
-        self.log_out = QTextBrowser(self)
-
+    def create_card(self, title):
+        frame = QGroupBox() # styled as card
         layout = QVBoxLayout()
-        layout.addWidget(self.log_out)
-        self.setLayout(layout)
+        lbl_title = QLabel(title)
+        lbl_title.setStyleSheet("color: #888; font-size: 12px; font-weight: bold;")
+        lbl_value = QLabel("--")
+        lbl_value.setStyleSheet("color: #fff; font-size: 24px; font-weight: bold;")
+        lbl_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        layout.addWidget(lbl_title)
+        layout.addWidget(lbl_value)
+        frame.setLayout(layout)
+        frame.lbl_value = lbl_value # store ref
+        return frame
+
+    def create_progress_bar(self, title):
+        container = QWidget()
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0,0,0,0)
+        
+        lbl = QLabel(title)
+        lbl.setFixedWidth(100)
+        
+        # Use our new animated class
+        pbar = AnimatedProgressBar()
+        pbar.setRange(0, 100)
+        pbar.setTextVisible(True)
+        pbar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #444;
+                border-radius: 5px;
+                text-align: center;
+                color: white;
+            }
+            QProgressBar::chunk {
+                background-color: #00D1FF;
+                border-radius: 4px;
+            }
+        """)
+
+        lbl_extra = QLabel("") # For e.g. "12GB / 16GB"
+        lbl_extra.setFixedWidth(100)
+        lbl_extra.setAlignment(Qt.AlignmentFlag.AlignRight)
+
+        layout.addWidget(lbl)
+        layout.addWidget(pbar)
+        layout.addWidget(lbl_extra)
+        container.setLayout(layout)
+        
+        return {'container': container, 'bar': pbar, 'extra': lbl_extra}
+
+    def set_mode(self, mode_name):
+        log.info("Dashboard loading preset: %s", mode_name)
+        # Only load the software preset to avoid requiring sudo for hardware changes
+        self.controller.on_load_from_preset(mode_name)
+
+    @pyqtSlot(object, object, object, object, str, object, object, object)
+    def update_stats(self, cpu_temp, gpu_temp, fan1_rpm, fan2_rpm, profile, cpu_usage, ram_usage, gpu_usage):
+        # Update Cards
+        self.cpu_card.lbl_value.setText(f"{cpu_temp}°C")
+        self.gpu_card.lbl_value.setText(f"{gpu_temp}°C")
+        self.fan1_card.lbl_value.setText(f"{fan1_rpm}")
+        self.fan2_card.lbl_value.setText(f"{fan2_rpm}")
+
+        # Update Graphs
+        self.temp_graph.add_data([cpu_temp, gpu_temp])
+        self.fan_graph.add_data([fan1_rpm, fan2_rpm])
+
+        # Update Progress Bars
+        self.cpu_usage_bar['bar'].setValueSmooth(int(cpu_usage))
+        
+        self.ram_usage_bar['bar'].setValueSmooth(int(ram_usage[0]))
+        self.ram_usage_bar['extra'].setText(f"{ram_usage[1]}GB / {ram_usage[2]}GB")
+        
+        self.gpu_usage_bar['bar'].setValueSmooth(int(gpu_usage[0]))
+        if gpu_usage[1] > 0:
+             self.gpu_usage_bar['extra'].setText(f"{int(gpu_usage[1])} MB")
+        
+        # Also update FanCurve tab if visible - REMOVING this potential crash point
+        # if self.controller.view_fancurve:
+        #     pass
+
+# Automation and Log tabs removed for simplification
 
 # pylint: disable=too-few-public-methods
 
@@ -1411,18 +1827,19 @@ class LogTab(QWidget):
 # pylint: disable=too-few-public-methods
 class Tabs(QTabWidget):
     def __init__(self, controller):
+        print("DEBUG: Tabs.__init__ started")
         super().__init__()
         # setup controller
         self.controller = controller
         self.controller.tabs = self
 
         # setup tabs
-        self.tabs = (
-            ("Fan Curve", FanCurveTab(controller)),
-            ("Other Options", OtherOptionsTab(controller)),
-            ("Automation", AutomationTab(controller)),
-            ("Log", LogTab(controller))
-        )
+        print("DEBUG: Creating tab views")
+        self.tabs = [
+            ("Panel", DashboardTab(controller)),
+            ("Curva de Ventiladores", FanCurveTab(controller)),
+            ("Otras Opciones", OtherOptionsTab(controller))
+        ]
 
         for tab_name, tab in self.tabs:
             area = QScrollArea()
@@ -1452,25 +1869,33 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("LenovoLegionLinux")
         self.icon = icon
         self.setWindowIcon(self.icon)
+        
+        print("DEBUG: MainWindow calling init_ui")
+        self.init_ui(controller)
+        print("DEBUG: MainWindow.__init__ finished")
 
 
 
+    
+    def init_ui(self, controller):
+        print("DEBUG: MainWindow.init_ui started")
         # tabs
         self.tabs = Tabs(controller)
 
         # bottom buttons
-        self.quit_button = QPushButton("Quit")
+        self.quit_button = QPushButton("Salir")
         self.quit_button.clicked.connect(controller.app_close)
-        self.ok_button = QPushButton("Save")
+        self.ok_button = QPushButton("Guardar")
         self.ok_button.clicked.connect(controller.save_settings)
-        self.ok_quit_button = QPushButton("Save and Quit")
+        self.ok_quit_button = QPushButton("Guardar y Salir")
         self.ok_quit_button.clicked.connect(controller.app_close_and_save)
         self.button_layout = QHBoxLayout()
-        # Push to the right with strecht
+        # Center with stretches on both sides
         self.button_layout.addStretch()
         self.button_layout.addWidget(self.quit_button)
         self.button_layout.addWidget(self.ok_button)
         self.button_layout.addWidget(self.ok_quit_button)
+        self.button_layout.addStretch()
 
         # main layout
         self.main_layout = QVBoxLayout()
@@ -1557,26 +1982,27 @@ class LegionTray:
         # ---
         self.menu.addSeparator()
         # open
-        self.open_action = QAction("Show")
+        self.open_action = QAction("Mostrar")
         self.open_action.triggered.connect(self.controller.app_show)
         self.menu.addAction(self.open_action)
         # quit
-        self.quit_action = QAction("Quit")
+        self.quit_action = QAction("Salir")
         self.quit_action.triggered.connect(self.controller.app_close)
         self.menu.addAction(self.quit_action)
         self.tray.setContextMenu(self.menu)
         self.tray.show()
         # ---
         self.menu.addSeparator()
-        self.batteryconservation_action = QAction("Conservation Mode")
+        self.batteryconservation_action = QAction("Modo Conservación")
         self.menu.addAction(self.batteryconservation_action)
-        self.rapid_charging_action = QAction("Rapid Charging")
+        self.rapid_charging_action = QAction("Carga Rápida")
         self.menu.addAction(self.rapid_charging_action)
-        self.fnlock_action = QAction("Fn Lock")
+        self.fnlock_action = QAction("Bloqueo Fn")
         self.menu.addAction(self.fnlock_action)
-        self.touchpad_action = QAction("Touchpad Enabled")
+        print("DEBUG: LegionTray.__init__ finished")
+        self.touchpad_action = QAction("Touchpad Habilitado")
         self.menu.addAction(self.touchpad_action)
-        self.always_on_usb_charging_action = QAction("Always On USB Charging")
+        self.always_on_usb_charging_action = QAction("Carga USB Siempre Activa")
         self.menu.addAction(self.always_on_usb_charging_action)
         # ---
         self.menu.addSeparator()
@@ -1651,6 +2077,149 @@ def get_icon_path(controller):
         icon_path = get_ressource_path('legion_logo.png')
     return icon_path
 
+def get_stylesheet(theme_mode='dark'):
+    is_dark = theme_mode == 'dark'
+    
+    # Base Colors
+    bg_color = "#0E110E" if is_dark else "#F5F7F8"
+    fg_color = "#FFFFFF" if is_dark else "#2D3436"
+    panel_bg = "#202C41" if is_dark else "#FFFFFF"
+    border_color = "#343F52" if is_dark else "#D1D8E0"
+    tab_bg = "#202C41" if is_dark else "#E8ECEF"
+    accent_blue = "#43D2DE" if is_dark else "#007BFF"
+    accent_pink = "#E54297" if is_dark else "#D63384"
+    
+    return f"""
+        QWidget {{
+            background-color: {bg_color};
+            color: {fg_color};
+            font-family: 'Segoe UI', 'Roboto', sans-serif;
+            font-size: 13px;
+        }}
+        QMainWindow, QDialog, QTabWidget::pane {{
+            border: 1px solid {border_color};
+        }}
+        QGroupBox {{
+            border: 2px solid {border_color};
+            border-radius: 8px;
+            margin-top: 15px;
+            font-weight: bold;
+            color: {fg_color};
+        }}
+        QGroupBox::title {{
+            subcontrol-origin: margin;
+            left: 10px;
+            padding: 0 5px 0 5px;
+        }}
+        QPushButton {{
+            background-color: {panel_bg};
+            border: 1px solid {border_color};
+            border-radius: 4px;
+            padding: 6px 12px;
+            color: {fg_color};
+        }}
+        QPushButton:hover {{
+            background-color: {"#343F52" if is_dark else "#E9ECEF"};
+            border: 1px solid {accent_blue};
+        }}
+        
+        /* Dashboard Mode Buttons - Neon Neon Neon! */
+        /* Dashboard Mode Buttons - Solid & Vibrant */
+        QPushButton#quiet_btn {{
+            background-color: #00D1FF;
+            color: white;
+            border: none;
+            font-weight: bold;
+            font-size: 16px;
+            padding: 10px;
+            border-radius: 8px;
+        }}
+        QPushButton#quiet_btn:hover {{
+            background-color: #00B6E0;
+        }}
+        
+        QPushButton#balanced_btn {{
+            background-color: #FFFFFF;
+            color: #000000;
+            border: 1px solid #D1D8E0;
+            font-weight: bold;
+            font-size: 16px;
+            padding: 10px;
+            border-radius: 8px;
+        }}
+        QPushButton#balanced_btn:hover {{
+            background-color: #F0F0F0;
+        }}
+        
+        QPushButton#perf_btn {{
+            background-color: #FF3131;
+            color: white;
+            border: none;
+            font-weight: bold;
+            font-size: 16px;
+            padding: 10px;
+            border-radius: 8px;
+        }}
+        QPushButton#perf_btn:hover {{
+            background-color: #E62020;
+        }}
+
+        QLineEdit, QSpinBox, QComboBox {{
+            background-color: {bg_color};
+            border: 1px solid {border_color};
+            border-radius: 4px;
+            padding: 4px;
+            color: {fg_color};
+        }}
+        
+        QComboBox QLineEdit {{
+            background: transparent;
+            padding: 0px;
+            margin: 0px;
+        }}
+        
+        QComboBox::drop-down {{
+            border: none;
+            width: 0px;
+        }}
+        QComboBox::down-arrow {{
+            image: none;
+            width: 0px;
+        }}
+        
+        QSpinBox::up-button, QSpinBox::down-button {{
+            width: 0px;
+            border: none;
+        }}
+        QSpinBox::up-arrow, QSpinBox::down-arrow {{
+            image: none;
+        }}
+
+        QTabBar::tab {{
+            background: {tab_bg};
+            border: 1px solid {border_color};
+            padding: 8px 15px;
+        }}
+        QTabBar::tab:selected {{
+            background: {accent_blue};
+            color: {"#0E110E" if is_dark else "white"};
+        }}
+        QCheckBox::indicator {{
+            width: 18px;
+            height: 18px;
+            background-color: {panel_bg};
+            border: 1px solid {border_color};
+            border-radius: 3px;
+        }}
+        QCheckBox::indicator:checked {{
+            background-color: {accent_pink};
+        }}
+        QScrollArea {{
+            border: none;
+            background-color: {bg_color};
+        }}
+    """
+
 def main():
     # Set the desktop file name
     # This make the window icon appear on wayland
@@ -1658,99 +2227,10 @@ def main():
 
     app = QApplication(sys.argv)
     
-    # Futuristic Dark Theme
-    app.setStyleSheet("""
-        QWidget {
-            background-color: #0E110E;
-            color: #FFFFFF;
-            font-family: 'Segoe UI', 'Roboto', sans-serif;
-            font-size: 13px;
-        }
-        QMainWindow, QDialog, QTabWidget::pane {
-            border: 1px solid #202C41;
-        }
-        QGroupBox {
-            border: 2px solid #202C41;
-            border-radius: 8px;
-            margin-top: 15px;
-            font-weight: bold;
-            color: #FFFFFF;
-        }
-        QGroupBox::title {
-            subcontrol-origin: margin;
-            left: 10px;
-            padding: 0 5px 0 5px;
-        }
-        QPushButton {
-            background-color: #202C41;
-            border: 1px solid #43D2DE;
-            border-radius: 4px;
-            padding: 6px 12px;
-            color: #FFFFFF;
-        }
-        QPushButton:hover {
-            background-color: #343F52;
-            border: 1px solid #E54297;
-        }
-        QPushButton:pressed {
-            background-color: #1E3CDE;
-        }
-        QLineEdit, QSpinBox, QComboBox {
-            background-color: #0E110E;
-            border: 1px solid #343F52;
-            border-radius: 4px;
-            padding: 4px;
-            color: #FFFFFF;
-        }
-        QLineEdit:focus, QSpinBox:focus, QComboBox:focus {
-            border: 1px solid #43D2DE;
-        }
-        QTabWidget::tab-bar {
-            left: 5px;
-        }
-        QTabBar::tab {
-            background: #202C41;
-            border: 1px solid #343F52;
-            padding: 8px 15px;
-            border-top-left-radius: 4px;
-            border-top-right-radius: 4px;
-            color: #8DC8E6;
-        }
-        QTabBar::tab:selected {
-            background: #43D2DE;
-            color: #0E110E;
-            border: none;
-        }
-        QTabBar::tab:hover:!selected {
-            background: #313844;
-        }
-        QCheckBox {
-            color: #FFFFFF;
-        }
-        QCheckBox::indicator {
-            width: 18px;
-            height: 18px;
-            background-color: #202C41;
-            border: 1px solid #343F52;
-            border-radius: 3px;
-        }
-        QCheckBox::indicator:checked {
-            background-color: #E54297;
-            border: none;
-        }
-        QScrollArea {
-            border: none;
-            background-color: #0E110E;
-        }
-        QTextBrowser {
-            background-color: #000000;
-            border: 1px solid #202C41;
-            color: #FFFFFF;
-        }
-        QLabel[styleSheet*="color: red"] {
-            color: #E54297 !important;
-        }
-    """)
+    # Apply a temporary default theme; the saved preference will be applied after loading settings
+    theme = get_color_mode()
+    if theme == 'unknown': theme = 'dark'
+    app.setStyleSheet(get_stylesheet(theme))
 
     use_legion_cli_to_write = '--use_legion_cli_to_write' in sys.argv
     # When running as a regular user, writing to sysfs will fail and can cause the GUI
@@ -1758,9 +2238,25 @@ def main():
     # pkexec/polkit for privileged writes.
     if (not use_legion_cli_to_write) and (os.geteuid() != 0):
         use_legion_cli_to_write = True
+    # Determine config directory
+    if os.geteuid() == 0:
+        config_dir = "/etc/legion_linux"
+    else:
+        config_home = os.environ.get('XDG_CONFIG_HOME', os.path.expanduser('~/.config'))
+        config_dir = os.path.join(config_home, 'legion_linux')
+    
+    # Ensure config directory exists
+    try:
+        if not os.path.exists(config_dir):
+            os.makedirs(config_dir, exist_ok=True)
+            print(f"Created config directory: {config_dir}")
+    except Exception as e:
+        print(f"Error creating config directory {config_dir}: {e}")
+
     do_not_excpect_hwmon = False
     controller = LegionController(app, expect_hwmon=not do_not_excpect_hwmon,
-                             use_legion_cli_to_write=use_legion_cli_to_write)
+                             use_legion_cli_to_write=use_legion_cli_to_write,
+                             config_dir=config_dir)
 
     # Load savable settings from file if exists
     controller.model.load_settings()
@@ -1798,10 +2294,14 @@ def main():
     main_window = MainWindow(controller, icon)
     controller.init(read_from_hw=not do_not_excpect_hwmon)
 
+    # Apply persisted theme preference (overrides the initial autodetect)
+    controller.init_theme_from_settings()
+
     # Tray
-    tray = LegionTray(icon, main_window, controller)
-    tray.show()
-    controller.tray = tray
+    # tray = LegionTray(icon, main_window, controller)
+    # tray.show()
+    # controller.tray = tray
+    controller.tray = None
     controller.init_tray()
 
     # Start Windows

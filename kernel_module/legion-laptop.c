@@ -3642,13 +3642,13 @@ static ssize_t ec_read_powermode(struct legion_private *priv, int *powermode)
 	*powermode =
 		ecram_read(&priv->ecram, priv->conf->registers->EXT_POWERMODE);
 
-	pr_info("ec_read_powermode scan 0xC400-0xC6FF:\n");
-	for (i = 0xC400; i < 0xC700; i++) {
-		u8 val = ecram_read(&priv->ecram, i);
-		if (val != 0) {
-			pr_info("  reg 0x%x = 0x%x\n", i, val);
-		}
-	}
+	// pr_info("ec_read_powermode scan 0xC400-0xC6FF:\n");
+	// for (i = 0xC400; i < 0xC700; i++) {
+	// 	u8 val = ecram_read(&priv->ecram, i);
+	// 	if (val != 0) {
+	// 		pr_info("  reg 0x%x = 0x%x\n", i, val);
+	// 	}
+	// }
 
 	return 0;
 }

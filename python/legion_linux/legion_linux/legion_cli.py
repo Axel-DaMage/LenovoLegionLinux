@@ -359,6 +359,67 @@ def set_feature(legion: LegionModelFacade, name, values, **_) -> int:
         print(feat)
     return -2
 
+
+def run_service(legion: LegionModelFacade, **_):
+    import sys
+    import shlex
+    import base64
+    
+    # Send ready signal
+    print("READY", flush=True)
+    
+    while True:
+        try:
+            line = sys.stdin.readline()
+            if not line:
+                break
+            
+            line = line.strip()
+            if not line:
+                continue
+                
+            parts = shlex.split(line)
+            if not parts:
+                continue
+            
+            cmd = parts[0]
+            args = parts[1:]
+            
+            try:
+                if cmd == 'set-feature':
+                    # args: name value_base64...
+                    if len(args) < 2:
+                        print("ERROR: Missing arguments for set-feature", flush=True)
+                        continue
+                    name = args[0]
+                    # Decode values from base64
+                    try:
+                        values = [base64.b64decode(v).decode('utf-8') for v in args[1:]]
+                    except Exception as decode_err:
+                        print(f"ERROR: Base64 decode error: {decode_err}", flush=True)
+                        continue
+
+                    if legion.set_feature_to_str_value(name, values):
+                        print("OK", flush=True)
+                    else:
+                        print("ERROR: Feature not found or failed", flush=True)
+
+                elif cmd == 'ping':
+                    print("PONG", flush=True)
+                
+                else:
+                    print(f"ERROR: Unknown command {cmd}", flush=True)
+            except Exception as e:
+                print(f"ERROR: {str(e)}", flush=True)
+                
+        except KeyboardInterrupt:
+            break
+        except Exception as outer_e:
+            log.error(f"Service loop error: {outer_e}")
+            break
+            
+    return 0
+
 def create_argparser()->argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Legion CLI')
     parser.add_argument(
@@ -367,6 +428,10 @@ def create_argparser()->argparse.ArgumentParser:
                         help='Level of log output', choices=loglevels, default='ERROR')
 
     subcommands = parser.add_subparsers(title='subcommands', dest='subcommand')
+
+    service_parser = subcommands.add_parser(
+        'service', help='Run in service mode (persistent session)')
+    service_parser.set_defaults(func=run_service)
 
     autocomplete_install_parser = subcommands.add_parser(
         'autocomplete-install', help='Install autocompletion in shell for this tool')

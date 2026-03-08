@@ -12,13 +12,23 @@ import yaml
 import sys
 import struct
 import zlib
+import concurrent.futures
 from datetime import datetime
 from PIL import Image
 # import jsonrpyc
 # import inotify.adapters
 
 
+
+# Global executor for file reads
+# start_monitor_executor = concurrent.futures.ThreadPoolExecutor(max_workers=30)
+
 log = logging.getLogger(__name__)
+
+
+def read_file_process(file_path):
+    with open(file_path, "r", encoding=DEFAULT_ENCODING) as filepointer:
+        return str(filepointer.read()).strip()
 
 
 DEFAULT_ENCODING = "utf8"
@@ -121,25 +131,126 @@ class NamedValue:
         self.name = name
 
 
+class LegionCliService:
+    _instance = None
+    
+    def __init__(self):
+        self.process = None
+        
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = LegionCliService()
+        return cls._instance
+        
+    def _start_process(self):
+        if self.process:
+            if self.process.poll() is None:
+                return True
+            self.process = None
+
+        log.info("Starting persistent legion_cli service...")
+        cmd = ['pkexec', 'legion_cli', 'service']
+        try:
+            self.process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                bufsize=1 # Line buffered
+            )
+            
+            line = self.process.stdout.readline()
+            if not line:
+                err = self.process.stderr.read() if self.process.stderr else "Unknown error"
+                log.error(f"legion_cli service failed to start: {err}")
+                self.process = None
+                return False
+                
+            if line.strip() != "READY":
+                log.error(f"legion_cli service sent unexpected handshake: {line}")
+                self.process.kill()
+                self.process = None
+                return False
+                
+            log.info("legion_cli service started and ready.")
+            return True
+            
+        except Exception as e:
+            log.error(f"Failed to start legion_cli service: {e}")
+            self.process = None
+            return False
+
+    def set_feature(self, name, values):
+        import base64
+        if not self.process or self.process.poll() is not None:
+            if not self._start_process():
+                raise IOError("Could not start legion_cli service")
+        
+        # Encode values to base64 to avoid issues with spaces/special chars
+        b64_values = [base64.b64encode(str(v).encode('utf-8')).decode('utf-8') for v in values]
+        cmd_str = f"set-feature {name} {' '.join(b64_values)}\n"
+        
+        try:
+            log.info(f"Sending to service: {cmd_str.strip()}")
+            self.process.stdin.write(cmd_str)
+            self.process.stdin.flush()
+            
+            response = self.process.stdout.readline()
+            if not response:
+                log.error("Service process died reading response")
+                self.process = None
+                # Try to restart and retry once?
+                if self._start_process():
+                    log.info("Restarted service, retrying command...")
+                    self.process.stdin.write(cmd_str)
+                    self.process.stdin.flush()
+                    response = self.process.stdout.readline()
+                    if not response:
+                         raise IOError("Service process died again")
+                else:
+                    raise IOError("Service process died and could not restart")
+                
+            response = response.strip()
+            if response == "OK":
+                return
+            else:
+                log.error(f"Service returned error: {response}")
+                raise IOError(f"Service error: {response}")
+                
+        except BrokenPipeError:
+            log.error("Broken pipe to legion_cli service")
+            self.process = None
+            raise IOError("Broken pipe to service")
+
 def write_file_with_legion_cli(name, values):
-    cmd_list = ['pkexec', 'legion_cli', 'set-feature', name]
-    cmd_list = cmd_list + [str(val) for val in values]
-    log.info('FileFeature %s execute "%s"', name, cmd_list)
-    out_str = ""
-    err_str = ""
     try:
-        with subprocess.Popen(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
-            stdout, stderr = process.communicate(timeout=None)
-            out_str = stdout.decode(DEFAULT_ENCODING)
-            err_str = stderr.decode(DEFAULT_ENCODING)
-            returncode = process.returncode
-            log.info('FileFeature %s executed with code %d: %s; %s',
-                     name, returncode, out_str, err_str)
-    except IOError as err:
-        log.error('FileFeature %s executed with error %s and out %s and err %s', name, str(
-            err), out_str, err_str)
+        LegionCliService.get_instance().set_feature(name, values)
+    except Exception as err:
+        log.error('FileFeature %s executed with error %s', name, str(err))
         log.error(get_dmesg(only_tail=True, filter_log=False))
-        raise err
+        # Fallback to old method if service fails?
+        # Maybe better to propagate error so user knows something is wrong.
+        # But for reliability, if service fails completely, we might want to try one-off command.
+        # For now, let's assume if service fails, we are in trouble.
+        # Actually, let's implement fallback for robustness during dev.
+        log.info("Falling back to single-shot pkexec...")
+        cmd_list = ['pkexec', 'legion_cli', 'set-feature', name]
+        cmd_list = cmd_list + [str(val) for val in values]
+        log.info('FileFeature %s execute "%s"', name, cmd_list)
+        out_str = ""
+        err_str = ""
+        try:
+            with subprocess.Popen(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+                stdout, stderr = process.communicate(timeout=None)
+                out_str = stdout.decode(DEFAULT_ENCODING)
+                err_str = stderr.decode(DEFAULT_ENCODING)
+                returncode = process.returncode
+                log.info('FileFeature %s executed with code %d: %s; %s',
+                         name, returncode, out_str, err_str)
+        except IOError as err2:
+            raise err2
 
 # def write_file_with_legion_cli_rpc(name, value):
 
@@ -260,15 +371,13 @@ class FileFeature(Feature):
         log.info('Feature %s reading', self.name())
         if not self.exists():
             log.warning('Feature %s reading from non existing', self.name())
+            return "0"
         try:
-            with open(file_path, "r", encoding=DEFAULT_ENCODING) as filepointer:
-                out = str(filepointer.read()).strip()
-            log.info('Feature %s reading: %s', self.name(), str(out))
-            return out
-        except IOError as err:
+            with open(file_path, 'r') as f:
+                return f.read().strip()
+        except (IOError, ValueError) as err:
             log.error('Feature %s reading error %s', self.name(), str(err))
-            log.error(get_dmesg(only_tail=True, filter_log=False))
-            raise err
+            return "0"
 
     def _read_file_int(self, file_path) -> int:
         return int(self._read_file_str(file_path))
@@ -340,36 +449,7 @@ class BoolFileFeature(FileFeature):
         return invalue != 0
 
 
-class LegionGUIAutostart(BoolFileFeature):
 
-    def __init__(self):
-        self.autostart_dekstop_folder_path = Path.home() / ".config" / "autostart"
-        self.desktop_file_path = Path(
-            '/usr/share/applications') / 'legion_gui_user.desktop'
-        self.autostart_desktop_file_path = self.autostart_dekstop_folder_path / \
-            "legion_gui_user.desktop"
-        super().__init__(str(Path.home() / ".config"))
-
-    def exists(self):
-        return self.desktop_file_path.exists() and self.autostart_dekstop_folder_path.exists()
-
-    def set(self, value: bool):
-        log.info('Feature %s setting to %d', self.name(), value)
-        if value:
-            src = self.desktop_file_path
-            dest = self.autostart_desktop_file_path
-            log.info('Feature %s: Copy %s to %s', self.name(), src, dest)
-            shutil.copyfile(src, dest)
-        else:
-            dest = self.autostart_desktop_file_path
-            log.info('Feature %s: Delete %s', self.name(), dest)
-            dest.unlink(missing_ok=True)
-            log.info('Feature %s: Deleted %s', self.name(), dest)
-
-    def get(self) -> bool:
-        if not self.autostart_desktop_file_path.exists():
-            return False
-        return True
 
 
 class IntFileFeature(FileFeature):
@@ -693,44 +773,7 @@ class BoolCommandFeature(CommandFeature):
         raise NotImplementedError()
 
 
-class SystemDServiceFeature(BoolCommandFeature):
-    def __init__(self, servicename):
-        super().__init__([])
-        self.status_cmd = f'systemctl status {servicename}'
-        self.stop_cmd = f'systemctl stop {servicename}'
-        self.start_cmd = f'systemctl start {servicename}'
-        self.enable_cmd = f'systemctl enable {servicename}'
-        self.disable_cmd = f'systemctl disable {servicename}'
-        self.read_cmd = f'systemctl is-active {servicename}'
-        self._exists = self._does_service_exists()
 
-    def _does_service_exists(self):
-        _, returncode = self._exec_cmd(self.status_cmd)
-        return returncode != 4
-
-    def set(self, value: bool):
-        if value:
-            self._exec_cmd(self.start_cmd)
-            self._exec_cmd(self.enable_cmd)
-        else:
-            self._exec_cmd(self.stop_cmd)
-            self._exec_cmd(self.disable_cmd)
-
-    def get(self) -> bool:
-        if self.exists():
-            _, returncode = self._exec_cmd(self.read_cmd)
-            return returncode == 0
-        return False
-
-
-class PowerProfilesDeamonService(SystemDServiceFeature):
-    def __init__(self):
-        super().__init__('power-profiles-daemon')
-
-
-class LenovoLegionLaptopSupportService(SystemDServiceFeature):
-    def __init__(self):
-        super().__init__('legiond.service legiond-onresume.service legiond-cpuset.service legiond-cpuset.timer')
 
 
 class FanCurveIO(Feature):
@@ -766,6 +809,7 @@ class FanCurveIO(Feature):
 
     def _find_hwmon_dir(self):
         matches = glob.glob(self.hwmon_dir_pattern)
+        print(f"DEBUG: Searching hwmon in {self.hwmon_dir_pattern}, Matches: {matches}")
         if matches:
             return matches[0]+'/'
         return None
@@ -778,8 +822,14 @@ class FanCurveIO(Feature):
 
     @staticmethod
     def _read_file(file_path):
-        with open(file_path, "r", encoding=DEFAULT_ENCODING) as filepointer:
-            return int(filepointer.read())
+        try:
+            with open(file_path, 'r') as f:
+                val = int(f.read().strip())
+                # log.debug(f"Read {file_path}: {val}")
+                return val
+        except (IOError, ValueError) as e:
+            log.error(f"Failed to read {file_path}: {e}")
+            return 0
 
     @staticmethod
     def _read_file_or(file_path, default):
@@ -800,20 +850,15 @@ class FanCurveIO(Feature):
     def get_fan_1_max_rpm(self):
         file_path = self.hwmon_path + self.fan1_max
         val = int(self._read_file(file_path))
-        # Hardware reports 10000 as placeholder, but actual max is ~4500 RPM
-        # Using 4500 for correct PWM conversion
-        if val >= 10000:
-            return 4500
-        return val
+        # The kernel uses MAX_RPM (10000) for FAN_SPEED_UNIT_RPM_HUNDRED conversion.
+        # fan_max reports this same value. We must use it as-is for correct
+        # PWM <-> RPM mapping. Capping to 4500 inflated all speeds ~2.2x.
+        return val if val > 0 else 10000
 
     def get_fan_2_max_rpm(self):
         file_path = self.hwmon_path + self.fan2_max
         val = int(self._read_file(file_path))
-        # Hardware reports 10000 as placeholder, but actual max is ~4500 RPM
-        # Using 4500 for correct PWM conversion
-        if val >= 10000:
-            return 4500
-        return val
+        return val if val > 0 else 10000
 
     def set_fan_1_speed_pwm(self, point_id, value):
         point_id = self._validate_point_id(point_id)
@@ -927,6 +972,22 @@ class FanCurveIO(Feature):
         file_path = self.hwmon_path + self.pwm1_decel.format(point_id)
         return self._read_file(file_path)
 
+    def get_cpu_temp(self):
+        file_path = self.hwmon_path + "temp1_input"
+        return round(self._read_file(file_path) / 1000.0, 1)
+
+    def get_gpu_temp(self):
+        file_path = self.hwmon_path + "temp2_input"
+        return round(self._read_file(file_path) / 1000.0, 1)
+
+    def get_fan_1_rpm(self):
+        file_path = self.hwmon_path + "fan1_input"
+        return self._read_file(file_path)
+
+    def get_fan_2_rpm(self):
+        file_path = self.hwmon_path + "fan2_input"
+        return self._read_file(file_path)
+
     def has_minifancurve(self):
         return self.exists() and self.hwmon_path is not None and os.path.exists(self.hwmon_path + self.minifancurve)
 
@@ -957,10 +1018,11 @@ class FanCurveIO(Feature):
         # pylint: disable=broad-except
         except BaseException as error:
             log.error(str(error))
-        # REMOVED: Automatic sanitization was causing unwanted overrides
-        # The previous code was converting 0 values to 127 and copying fan speeds
-        # This prevented users from setting their desired values
-        # The kernel module and EC firmware provide their own validation
+        # Kernel requires the first point (index 0) to have speed = 0.
+        # Writing non-zero speed to point 1 would be silently rejected by the driver.
+        if fan_curve.entries:
+            fan_curve.entries[0].fan1_speed = 0
+            fan_curve.entries[0].fan2_speed = 0
         
         # Minimal validation: Ensure Upper >= Lower for each entry
         for entry in fan_curve.entries:
@@ -990,9 +1052,20 @@ class FanCurveIO(Feature):
             last_entry = entry
 
         # Write in reverse order (10 to 1) to satisfy monotonicity constraints of the hardware
+        # Only write points within the EC's fancurve size (typically 9).
+        # Point 10 (index 9) is usually outside the size and would be silently rejected.
         reversed_entries = fan_curve.entries[::-1]
         for index, entry in enumerate(reversed_entries):
             point_id = 10 - index
+            pwm1 = round(entry.fan1_speed / self.get_fan_1_max_rpm() * 255.0) if entry.fan1_speed > 0 else 0
+            pwm2 = round(entry.fan2_speed / self.get_fan_2_max_rpm() * 255.0) if entry.fan2_speed > 0 else 0
+            log.info("Writing point %d: fan1=%d RPM (PWM %d), fan2=%d RPM (PWM %d), "
+                     "cpu=%d/%d, gpu=%d/%d, ic=%d/%d, accel=%d, decel=%d",
+                     point_id, entry.fan1_speed, pwm1, entry.fan2_speed, pwm2,
+                     entry.cpu_lower_temp, entry.cpu_upper_temp,
+                     entry.gpu_lower_temp, entry.gpu_upper_temp,
+                     entry.ic_lower_temp, entry.ic_upper_temp,
+                     entry.acceleration, entry.deceleration)
             self.set_fan_1_speed_rpm(point_id, entry.fan1_speed)
             self.set_fan_2_speed_rpm(point_id, entry.fan2_speed)
             self.set_lower_cpu_temperature(point_id, entry.cpu_lower_temp)
@@ -1007,6 +1080,7 @@ class FanCurveIO(Feature):
     def read_fan_curve(self) -> FanCurve:
         """Reads a fan curve object from the file system"""
         entries = []
+        last_entry = None
         for point_id in range(1, 11):
             fan1_speed = self.get_fan_1_speed_rpm(point_id)
             fan2_speed = self.get_fan_2_speed_rpm(point_id)
@@ -1018,12 +1092,32 @@ class FanCurveIO(Feature):
             ic_upper_temp = self.get_upper_ic_temperature(point_id)
             acceleration = self.get_acceleration(point_id)
             deceleration = self.get_deceleration(point_id)
+            
+            # Sanitization: If temps are 0, use last entry's values (monotonicity)
+            # Special handling for first point if it is 0
+            if cpu_lower_temp == 0:
+                 cpu_lower_temp = last_entry.cpu_lower_temp if last_entry else 20
+            if cpu_upper_temp == 0:
+                 cpu_upper_temp = last_entry.cpu_upper_temp if last_entry else 20
+            if gpu_lower_temp == 0:
+                 gpu_lower_temp = last_entry.gpu_lower_temp if last_entry else 20
+            if gpu_upper_temp == 0:
+                 gpu_upper_temp = last_entry.gpu_upper_temp if last_entry else 20
+            if ic_lower_temp == 0:
+                 ic_lower_temp = last_entry.ic_lower_temp if last_entry else 20
+            if ic_upper_temp == 0:
+                 ic_upper_temp = last_entry.ic_upper_temp if last_entry else 20
+
+            # print(f"DEBUG: Point {point_id} Sanitized Temp: {cpu_lower_temp}")
+
             entry = FanCurveEntry(fan1_speed=fan1_speed, fan2_speed=fan2_speed,
                                   cpu_lower_temp=cpu_lower_temp, cpu_upper_temp=cpu_upper_temp,
                                   gpu_lower_temp=gpu_lower_temp, gpu_upper_temp=gpu_upper_temp,
                                   ic_lower_temp=ic_lower_temp, ic_upper_temp=ic_upper_temp,
                                   acceleration=acceleration, deceleration=deceleration)
             entries.append(entry)
+            last_entry = entry
+            
         fancurve = FanCurve(name='unknown', entries=entries)
         try:
             fancurve.enable_minifancurve = self.get_minifancuve()
@@ -1039,6 +1133,7 @@ class ApplicationModel:
     open_closed_to_tray: BoolSettingFeature
     enable_gui_monitoring: BoolSettingFeature
     icon_color_mode: EnumSettingFeature
+    gui_theme: EnumSettingFeature
 
     def __init__(self):
         self.automatic_close = BoolSettingFeature('automatic_close')
@@ -1062,6 +1157,14 @@ class ApplicationModel:
         ]
         self.icon_color_mode = EnumSettingFeature("icon_color_mode", icon_color_modes[0].value, icon_color_modes)
         self.icon_color_mode.set(icon_color_modes[0].value)
+
+        gui_themes = [
+            NamedValue("dark", "Dark theme"),
+            NamedValue("light", "Light theme"),
+            NamedValue("auto", "Follow system theme")
+        ]
+        self.gui_theme = EnumSettingFeature("gui_theme", "auto", gui_themes)
+        self.gui_theme.set("auto")
 
 
 @dataclass
@@ -1160,7 +1263,8 @@ class FanCurveRepository(Feature):
         except FileNotFoundError:
             log.warning(f"Preset {name} not found, returning default empty curve.")
             # Return a default/empty curve to prevent crash
-            return FanCurve(name=name, entries=[FanCurveEntry(0, 0, 0, 0, 0, 0, 0, 0, 0, 0) for i in range(10)], enable_minifancurve=True)
+            # Use 20 for temps and 0 for speed
+            return FanCurve(name=name, entries=[FanCurveEntry(0, 0, 20, 20, 20, 20, 20, 20, 0, 0) for i in range(10)], enable_minifancurve=True)
 
     def load_by_name_or_default(self, name):
         if self.does_exists_by_name(name):
@@ -1295,7 +1399,8 @@ class NVIDIAGPUMonitor(Monitor):
         gpu_running_diag = DiagnosticMsg()
         if is_gpu_running:
             gpu_running_diag.value = True
-            gpu_running_diag.msg = 'GPU wakeup'
+            # gpu_running_diag.msg = 'GPU wakeup'
+            gpu_running_diag.msg = '' # Silent update
         else:
             gpu_running_diag.value = False
             gpu_running_diag.msg = 'GPU suspended'
@@ -1415,24 +1520,9 @@ class NotifcationSender:
 class SystemNotificationSender(NotifcationSender):
 
     def _send_notification(self, _, msg):
-        if is_root_user():
-            # Drop root privileges so we can send notifications
-            # TODOs: find a better way
-            # Code by user dvilela on stackoverflow
-            # https://stackoverflow.com/a/54718205
-            user_id = subprocess.run(['id', '-u', os.environ['SUDO_USER']],
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            check=True).stdout.decode("utf-8").replace('\n', '')
-            subprocess.run(['sudo', '-u', os.environ['SUDO_USER'],
-                            f'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{user_id}/bus',
-                            'notify-send', '-i', 'utilities-terminal', msg, msg],
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            check=True)
-        else:
-            with subprocess.Popen(['notify-send', msg]) as _:
-                pass
+        pass
+        # if is_root_user():
+        #     # Drop root privileges so we can s...
 
 
 class LegionModelFacade:
@@ -1487,10 +1577,7 @@ class LegionModelFacade:
              self.gpu_temperature_limit = None
 
 
-        # services
-        self.power_profiles_deamon_service = PowerProfilesDeamonService()
-        self.lenovo_legion_laptop_support_service = LenovoLegionLaptopSupportService()
-        self.legion_gui_autostart = LegionGUIAutostart()
+
 
         # monitors
         self.nvidia_gpu_running = NVIDIAGPUIsRunning()
@@ -1511,6 +1598,7 @@ class LegionModelFacade:
         self.settings_manager.add_feature(self.app_model.open_closed_to_tray)
         self.settings_manager.add_feature(self.app_model.enable_gui_monitoring)
         self.settings_manager.add_feature(self.app_model.icon_color_mode)
+        self.settings_manager.add_feature(self.app_model.gui_theme)
 
     def _replace_efi_file(self, original_file, new_file):
         subprocess.run(["chattr", "-i", original_file], check=True)
