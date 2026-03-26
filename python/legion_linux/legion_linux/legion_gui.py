@@ -51,6 +51,7 @@ log.setLevel('INFO')
 class MonitorSignals(QtCore.QObject):
     # cpu_temp, gpu_temp, fan1_rpm, fan2_rpm, profile, cpu_usage, ram_usage(tuple), gpu_usage(tuple)
     statsUpdated = QtCore.pyqtSignal(object, object, object, object, str, object, object, object)
+    acStateChanged = QtCore.pyqtSignal(bool)  # True = on AC, False = on battery
 
 
 class MonitorWorker(QRunnable):
@@ -61,6 +62,7 @@ class MonitorWorker(QRunnable):
         self.notification_sender = SystemNotificationSender()
         self.signals = MonitorSignals()
         self.system_stats = SystemStats()
+        self.prev_ac_state = None
 
 
     @pyqtSlot()
@@ -98,7 +100,17 @@ class MonitorWorker(QRunnable):
                 self.signals.statsUpdated.emit(cpu_temp, gpu_temp, fan1_rpm, fan2_rpm, profile, cpu_usage, ram_usage, gpu_usage)
             except Exception as err:
                 log.error("Error reading stats for dashboard: %s", str(err))
-            
+
+            # Detect AC state changes (charger connect/disconnect) to re-apply fan curve
+            try:
+                current_ac = self.model.on_power_supply.get()
+                if self.prev_ac_state is not None and current_ac != self.prev_ac_state:
+                    log.info("AC state changed: %s -> %s", self.prev_ac_state, current_ac)
+                    self.signals.acStateChanged.emit(current_ac)
+                self.prev_ac_state = current_ac
+            except Exception as err:
+                log.error("Error checking AC state: %s", err)
+
             for msg in diag_msgs:
                 if msg.has_value and msg.filter_do_output:
                      self.notification_sender.notify('Legion', msg.msg)
@@ -217,10 +229,10 @@ class EnumFeatureController:
                         value = val.value
 
                 if value is not None:
-                    print(f"Set to value: {value}")
+                    log.info("Set power mode to value: %s", value)
                     self.feature.set(value)
                 else:
-                    print(f"Value for gui_value {gui_value} not found")
+                    log.warning("Value for gui_value %s not found", gui_value)
             else:
                 self.widget.setDisabled(True)
         # pylint: disable=broad-except
@@ -498,7 +510,7 @@ class IntFeatureController:
                 gui_value = self.widget.value()
                 low, upper, _ = self.feature.get_limits_and_step()
                 if low <= gui_value <= upper:
-                    print(f"Set to value: {gui_value}")
+                    log.info("Set int feature to value: %s", gui_value)
                     self.feature.set(gui_value)
                 else:
                     print(
@@ -514,7 +526,7 @@ class IntFeatureController:
         self.update_view_from_feature()
 
     def update_view_from_feature(self, k=0, update_bounds=False):
-        print("update_view_from_feature", k)
+        log.info("update_view_from_feature: %d", k)
         try:
             if self.feature.exists():
                 # possible values
@@ -598,7 +610,6 @@ class LegionController:
     model: LegionModelFacade
     # fan
     lockfancontroller_controller: BoolFeatureController
-    maximumfanspeed_controller: BoolFeatureController
     # other
     fnlock_controller: BoolFeatureController
     winkey_controller: BoolFeatureController
@@ -646,31 +657,24 @@ class LegionController:
         self.monitoring_worker = MonitorWorker(None)
 
     def init(self, read_from_hw=True):
-        print("DEBUG: LegionController.init started")
         if not hasattr(self, 'show_root_dialog'):
             self.show_root_dialog = False
         # connect logger output to GUI
         # qt_handler.qt_obj.logWritten.connect(self.on_new_log_msg)
 
-        print("DEBUG: Setting monitoring worker model")
         self.monitoring_worker.model = self.model
         # Connect monitoring signals to Dashboard
         print(f"DEBUG: view_dashboard is {self.view_dashboard}")
         if self.view_dashboard:
-            print("DEBUG: Connecting update_stats")
             self.monitoring_worker.signals.statsUpdated.connect(self.view_dashboard.update_stats)
         else:
             print("ERROR: view_dashboard is None!")
         
-        print("DEBUG: Finished connecting statsUpdated")
 
         # fan
         self.lockfancontroller_controller = BoolFeatureController(
             self.view_fancurve.lockfancontroller_check,
             self.model.lockfancontroller)
-        self.maximumfanspeed_controller = BoolFeatureController(
-            self.view_fancurve.maximumfanspeed_check,
-            self.model.maximum_fanspeed)
         # other
         self.fnlock_controller = BoolFeatureController(
             self.view_otheroptions.fnlock_check,
@@ -715,7 +719,6 @@ class LegionController:
         self.model.app_model.enable_gui_monitoring.add_callback(self.on_enable_monitoring_change)
 
         if read_from_hw:
-            print("DEBUG: Reading from hw (async)")
             import threading
             threading.Thread(target=self.on_read_fan_curve_from_hw, daemon=True).start()
             # log.warning("HW Fan Curve reading DISABLED for debugging.")
@@ -727,13 +730,11 @@ class LegionController:
         self.update_other_gui()
         self.update_power_gui(True)
         # log.warning("Initial GUI updates DISABLED for debugging.")
-        self.view_fancurve.set_presets(self.model.fancurve_repo.get_names())
         self.main_window.show_root_dialog = self.show_root_dialog
         self.start_monitoring()
         # log.warning("Monitoring DISABLED for debugging.")
 
     def init_tray(self):
-        print("DEBUG: LegionController.init_tray started")
         
         # Hard disable tray to prevent Segfaults on systems with broken DBus/Tray support
         log.warning("Tray icon disabled for stability.")
@@ -771,7 +772,6 @@ class LegionController:
         set_dependent(self.batteryconservation_tray_controller,
                       self.rapid_charging_tray_controller)
         self.rapid_charging_tray_controller.update_view_from_feature()
-        print("DEBUG: init_tray - charging controllers initialized")
 
         self.fnlock_tray_controller = BoolFeatureTrayController(
             self.tray.fnlock_action, self.model.fn_lock)
@@ -795,20 +795,10 @@ class LegionController:
         set_dependent(self.power_mode_tray_controller, self.power_mode_controller)
         self.power_mode_tray_controller.update_view_from_feature()
 
-        try:
-            self.preset_tray_controller = PresetTrayController(self.model,
-                [self.tray.preset1_action,
-                 self.tray.preset2_action,
-                 self.tray.preset3_action])
-            
-            # Connect signals
-            self.preset_tray_controller.view_changed.connect(self.on_load_from_preset)
-        except Exception as e:
-            log.error(f"Error initializing preset controller: {e}")
+        # Preset tray controller removed
 
     def update_fan_additional_gui(self):
         self.lockfancontroller_controller.update_view_from_feature()
-        self.maximumfanspeed_controller.update_view_from_feature()
 
     def update_other_gui(self):
         self.fnlock_controller.update_view_from_feature()
@@ -826,6 +816,7 @@ class LegionController:
             0, update_items=update_bounds)
 
     def power_gui_write_to_hw(self):
+        self.power_mode_controller.update_feature_from_view()
         self.update_power_gui()
 
     def update_fancurve_gui(self):
@@ -853,31 +844,14 @@ class LegionController:
             log.error(f"Error reading fan curve from HW: {e}")
 
     def on_write_fan_curve_to_hw(self):
-        # Debugging
-        print("DEBUG: on_write_fan_curve_to_hw called")
         self.model.fan_curve = self.view_fancurve.get_fancurve()
         self.model.write_fancurve_to_hw()
-        self.model.read_fancurve_from_hw()
+        # Update GUI from the in-memory sanitized curve (NOT hardware readback).
+        # write_fan_curve() modifies entries in-place (e.g. enforces monotonicity,
+        # clamps speed of trailing points). Showing those fixes keeps the graph
+        # consistent while avoiding the EC's point-1 temp rounding side-effect
+        # that appeared when re-reading from hardware.
         self.update_fancurve_gui()
-    def on_load_from_preset(self, name=None):
-        if not name or isinstance(name, bool):
-            name = self.view_fancurve.preset_combobox.currentText()
-        log.info("Loading preset: %s", name)
-        try:
-            self.model.load_fancurve_from_preset(name)
-            self.update_fancurve_gui()
-        except Exception as e:
-            log.error("Could not load preset %s: %s", name, str(e))
-
-    def on_save_to_preset(self, _=None):
-        name = self.view_fancurve.preset_combobox.currentText()
-        log.info("Saving preset: %s", name)
-        
-        self.model.fan_curve = self.view_fancurve.get_fancurve()
-        try:
-            self.model.save_fancurve_to_preset(name)
-        except Exception as e:
-            log.error(f"Could not save preset {name}: {e}")
 
 
 
@@ -885,11 +859,9 @@ class LegionController:
         try:
             self.model.save_settings()
             if self.view_fancurve:
-                name = self.view_fancurve.preset_combobox.currentText()
                 self.model.fan_curve = self.view_fancurve.get_fancurve()
-                self.model.save_fancurve_to_preset(name)
                 self.model.write_fancurve_to_hw()
-                log.info(f"Saved and applied FanCurve for preset: {name}")
+                log.info("Saved and applied FanCurve")
         except PermissionError as err:
             log_error(err)
 
@@ -927,12 +899,27 @@ class LegionController:
     def app_show(self):
         self.main_window.bring_to_foreground()
 
+    def on_ac_state_changed(self, is_on_ac):
+        """Re-apply the user's fan curve after charger connect/disconnect so EC resets don't stick."""
+        log.info("AC state changed (on_ac=%s). Re-applying fan curve to hardware.", is_on_ac)
+        if self.model.fan_curve and self.model.fan_curve.entries:
+            import threading
+            threading.Thread(target=self._reapply_fancurve, daemon=True).start()
+
+    def _reapply_fancurve(self):
+        try:
+            self.model.write_fancurve_to_hw()
+            log.info("Fan curve successfully re-applied after AC state change.")
+        except Exception as e:
+            log.error("Could not re-apply fan curve after AC state change: %s", e)
+
     def start_monitoring(self):
         log.info("Starting monitoring")
         if not self.monitoring_worker.running:
             self.monitoring_worker = MonitorWorker(self.model)
             # Reconnect signals as they were lost with the new worker
             self.monitoring_worker.signals.statsUpdated.connect(self.view_dashboard.update_stats)
+            self.monitoring_worker.signals.acStateChanged.connect(self.on_ac_state_changed)
             self.monitoring_worker.running = True
             self.monitoring_threadpool.start(self.monitoring_worker)
 
@@ -942,8 +929,7 @@ class LegionController:
 
     def on_enable_monitoring_change(self, _):
         if self.model.app_model.enable_gui_monitoring.get():
-            # self.start_monitoring()
-            log.warning("Monitoring callback DISABLED for debugging.")
+            self.start_monitoring()
         else:
             self.stop_monitoring()
 
@@ -951,9 +937,11 @@ class LegionController:
 class FanCurveEntryView(QtCore.QObject):
     tempChanged = QtCore.pyqtSignal(int, int) # point_id, new_temp_index (0=cpu, 1=gpu, 2=ic)
     
-    # Predefined discrete values as requested
-    RPM_VALUES = [0, 500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500]
-    TEMP_VALUES = [0, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+    # Predefined discrete values — 20 options for finer granularity
+    RPM_VALUES = [0, 200, 400, 600, 800, 1000, 1200, 1500, 1800, 2000,
+                  2200, 2500, 2800, 3000, 3200, 3500, 3700, 4000, 4200, 4500]
+    TEMP_VALUES = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45,
+                   50, 55, 60, 65, 70, 75, 80, 85, 90, 100]
 
     def __init__(self, point_id, layout, parent_tab):
         super().__init__()
@@ -961,7 +949,7 @@ class FanCurveEntryView(QtCore.QObject):
         self.parent_tab = parent_tab
         self.point_id_label = QLabel(f'{point_id}')
         self.point_id_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.point_id_label.setStyleSheet("font-weight: bold; color: #aaa;")
+        self.point_id_label.setStyleSheet("font-weight: bold;")
         
         self.fan_speed1_combo = self._create_combo(self.RPM_VALUES)
         self.fan_speed2_combo = self._create_combo(self.RPM_VALUES)
@@ -980,26 +968,7 @@ class FanCurveEntryView(QtCore.QObject):
         combo = QComboBox()
         combo.addItems([str(v) for v in values])
         combo.setEditable(False) # Strict selection only
-        # Connect signal
         combo.currentIndexChanged.connect(self.on_value_changed)
-        # Style to look minimal but clear
-        combo.setStyleSheet("""
-            QComboBox {
-                background-color: #2b2b2b;
-                color: #e0e0e0;
-                border: 1px solid #3d3d3d;
-                border-radius: 4px;
-                padding: 2px;
-            }
-            QComboBox::drop-down {
-                border: 0px;
-            }
-            QComboBox QAbstractItemView {
-                background-color: #2b2b2b;
-                selection-background-color: #444;
-                color: #e0e0e0;
-            }
-        """)
         return combo
 
     def on_value_changed(self):
@@ -1064,6 +1033,12 @@ class FanCurveEntryView(QtCore.QObject):
 
 class FanCurveGraph(QWidget):
     pointDragged = QtCore.pyqtSignal(int, int) # point_id (1-10), rpm
+    tempDragged = QtCore.pyqtSignal(int, int)  # point_id (1-10), cpu_temp
+
+    RPM_VALUES  = [0, 200, 400, 600, 800, 1000, 1200, 1500, 1800, 2000,
+                   2200, 2500, 2800, 3000, 3200, 3500, 3700, 4000, 4200, 4500]
+    TEMP_VALUES = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45,
+                   50, 55, 60, 65, 70, 75, 80, 85, 90, 100]
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1072,6 +1047,7 @@ class FanCurveGraph(QWidget):
         self.entries = []
         self.points = []
         self.dragging_idx = -1
+        self.dragging_temp = False  # True when dragging temperature point, False for speed
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1081,14 +1057,24 @@ class FanCurveGraph(QWidget):
         self.entries = entries
         self.update()
 
+    def _get_point_y(self, entry, h):
+        """Return (y_speed, y_temp) pixel positions for a given entry."""
+        y_speed = h - int(entry.fan1_speed * h / 4500)
+        y_temp  = h - int(entry.cpu_upper_temp * h / 100)
+        return y_speed, y_temp
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            w = self.width()
+            w, h = self.width(), self.height()
             col_w = w / 10
             idx = int(event.pos().x() / col_w)
             if 0 <= idx < len(self.entries):
                 self.dragging_idx = idx
-                self.update_drag(event.pos().y())
+                mouse_y = event.pos().y()
+                y_speed, y_temp = self._get_point_y(self.entries[idx], h)
+                # Choose the closest handle (speed vs temperature)
+                self.dragging_temp = abs(mouse_y - y_temp) < abs(mouse_y - y_speed)
+                self.update_drag(mouse_y)
 
     def mouseMoveEvent(self, event):
         if self.dragging_idx != -1:
@@ -1097,35 +1083,37 @@ class FanCurveGraph(QWidget):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.dragging_idx = -1
+            self.dragging_temp = False
 
     def update_drag(self, mouse_y):
         h = self.height()
         y = max(0, min(h, mouse_y))
-        raw_rpm = int((1 - y / h) * 4500)
-        
-        # Snap to nearest 500 (RPM Values from FanCurveEntryView)
-        # Using a simpler logic here to avoid circular dependency import issues if class access is tricky
-        rpm_values = [0, 500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500]
-        closest_rpm = min(rpm_values, key=lambda x: abs(x - raw_rpm))
-        
-        self.pointDragged.emit(self.dragging_idx + 1, closest_rpm)
+
+        if self.dragging_temp:
+            raw_temp = int((1 - y / h) * 100)
+            closest_temp = min(self.TEMP_VALUES, key=lambda x: abs(x - raw_temp))
+            self.tempDragged.emit(self.dragging_idx + 1, closest_temp)
+        else:
+            raw_rpm = int((1 - y / h) * 4500)
+            closest_rpm = min(self.RPM_VALUES, key=lambda x: abs(x - raw_rpm))
+            self.pointDragged.emit(self.dragging_idx + 1, closest_rpm)
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
+
         # Background
         painter.fillRect(self.rect(), QColor("#121212") if self.palette().window().color().lightness() < 128 else QColor("#FFFFFF"))
-        
+
         # Draw Grid
         painter.setPen(QColor(100, 100, 100, 50))
         w, h = self.width(), self.height()
-        
+
         # Horizontal lines (10 levels)
         for i in range(11):
             y = int(i * h / 10)
             painter.drawLine(0, y, w, y)
-        
+
         # Vertical lines (10 points)
         for i in range(11):
             x = int(i * w / 10)
@@ -1134,35 +1122,72 @@ class FanCurveGraph(QWidget):
         if not self.entries:
             return
 
-        # Draw Curves
-        # Fan 1: Cyan, Fan 2: Pink
+        # Draw speed curves: Fan 1 (Cyan) and Fan 2 (Pink)
         self.draw_curve(painter, 1, QColor("#43D2DE"))
         self.draw_curve(painter, 2, QColor("#E54297"))
+        # Draw CPU temperature curve (Red)
+        self.draw_temp_curve(painter, QColor("#FF4444"))
 
     def draw_curve(self, painter, fan_idx, color):
         w, h = self.width(), self.height()
         path = QPainterPath()
         started = False
-        
+
         painter.setPen(QPen(color, 2))
-        
+
         # Align points with 10 columns
         col_w = w / 10
-        
+
         for i, e in enumerate(self.entries):
             # Point alignment: center of the column
             x = int((i + 0.5) * col_w)
             # Y mapping: 0-4500 RPM
             speed = e.fan1_speed if fan_idx == 1 else e.fan2_speed
             y = h - int(speed * h / 4500)
-            
+
             if not started:
                 path.moveTo(x, y)
                 started = True
             else:
                 path.lineTo(x, y)
             painter.drawEllipse(x-3, y-3, 6, 6)
-        
+
+        painter.drawPath(path)
+
+    def draw_temp_curve(self, painter, color):
+        """Draw CPU temperature as a red curve with larger diamond-shaped handles."""
+        w, h = self.width(), self.height()
+        path = QPainterPath()
+        started = False
+        col_w = w / 10
+
+        painter.setPen(QPen(color, 2))
+        brush_color = QColor(color)
+        brush_color.setAlpha(200)
+        painter.setBrush(brush_color)
+
+        for i, e in enumerate(self.entries):
+            x = int((i + 0.5) * col_w)
+            # Y mapping: 0-100 °C
+            y = h - int(e.cpu_upper_temp * h / 100)
+
+            if not started:
+                path.moveTo(x, y)
+                started = True
+            else:
+                path.lineTo(x, y)
+
+            # Diamond shape to visually distinguish from speed circles
+            size = 5
+            diamond = QPainterPath()
+            diamond.moveTo(x,        y - size)
+            diamond.lineTo(x + size, y)
+            diamond.lineTo(x,        y + size)
+            diamond.lineTo(x - size, y)
+            diamond.closeSubpath()
+            painter.drawPath(diamond)
+
+        painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawPath(path)
 
 
@@ -1206,13 +1231,23 @@ class FanCurveTab(QWidget):
             # Block signals to prevent infinite recursion refreshing the graph
             view.fan_speed1_combo.blockSignals(True)
             view.fan_speed2_combo.blockSignals(True)
-            
+
             view._set_combo_value(view.fan_speed1_combo, rpm, view.RPM_VALUES)
             view._set_combo_value(view.fan_speed2_combo, rpm, view.RPM_VALUES)
-            
+
             view.fan_speed1_combo.blockSignals(False)
             view.fan_speed2_combo.blockSignals(False)
 
+            self.refresh_graph()
+
+    def on_graph_temp_dragged(self, point_id, temp):
+        idx = point_id - 1
+        if 0 <= idx < len(self.entry_edits):
+            view = self.entry_edits[idx]
+            for combo in (view.cpu_temp_combo, view.gpu_temp_combo, view.ic_temp_combo):
+                combo.blockSignals(True)
+                view._set_combo_value(combo, temp, view.TEMP_VALUES)
+                combo.blockSignals(False)
             self.refresh_graph()
 
     def get_fancurve(self) -> FanCurve:
@@ -1232,21 +1267,6 @@ class FanCurveTab(QWidget):
     def on_temp_changed(self, point_id, temp_type):
         self.refresh_graph()
 
-    def set_presets(self, presets):
-        self.preset_combobox.blockSignals(True)
-        self.preset_combobox.clear()
-        self.preset_combobox.addItems(list(presets))
-        self.preset_combobox.blockSignals(False)
-
-    def update_active_profile(self, profile):
-        profile = profile.strip().lower()
-        self.preset_combobox.blockSignals(True)
-        for i in range(self.preset_combobox.count()):
-            if profile in self.preset_combobox.itemText(i).lower():
-                self.preset_combobox.setCurrentIndex(i)
-                break
-        self.preset_combobox.blockSignals(False)
-
     def init_ui(self):
         # pylint: disable=too-many-statements
         self.fancurve_group = QGroupBox("Editor de Curva de Ventiladores")
@@ -1255,6 +1275,7 @@ class FanCurveTab(QWidget):
         # Add Graph in the grid spanning 10 columns
         self.graph = FanCurveGraph()
         self.graph.pointDragged.connect(self.on_graph_point_dragged)
+        self.graph.tempDragged.connect(self.on_graph_temp_dragged)
         self.layout.addWidget(self.graph, 0, 1, 1, 10)
         # log.warning("FanCurveGraph DISABLED for debugging.")
         
@@ -1276,8 +1297,6 @@ class FanCurveTab(QWidget):
         self.minfancurve_check = QCheckBox("Apagar ventiladores si está frío")
         self.lockfancontroller_check = QCheckBox(
             "Bloquear controlador, sensores y velocidad actual")
-        self.maximumfanspeed_check = QCheckBox(
-            "Forzar Velocidad Máxima")
         
         # Labels column
         self.layout.addWidget(self.point_id_label, 1, 0)
@@ -1316,58 +1335,31 @@ class FanCurveTab(QWidget):
         self.config_row.addSpacing(20)
         self.config_row.addWidget(self.minfancurve_check)
         self.config_row.addWidget(self.lockfancontroller_check)
-        self.config_row.addWidget(self.maximumfanspeed_check)
         self.config_row.addStretch()
         
         self.main_fancurve_layout.addLayout(self.config_row)
         self.fancurve_group.setLayout(self.main_fancurve_layout)
 
-        # Merge Hardware and Preset into one horizontal "Action Row"
-        self.action_group = QGroupBox("Hardware y Preajustes")
-        
-        # HW Section
+        # Hardware Action Row
+        self.action_group = QGroupBox("Hardware")
+
         self.load_button = QPushButton("Leer HW")
         self.write_button = QPushButton("Aplicar HW")
         self.load_button.clicked.connect(self.controller.on_read_fan_curve_from_hw)
         self.write_button.clicked.connect(self.controller.on_write_fan_curve_to_hw)
-        
-        # Preset Section
-        self.preset_combobox = QComboBox(self)
-        self.preset_combobox.setMinimumWidth(150)
-        self.preset_combobox.setEditable(False)
 
-        self.save_to_preset_button = QPushButton("Guardar Preajuste")
-        self.load_from_preset_button = QPushButton("Cargar Preajuste")
-        self.save_to_preset_button.clicked.connect(self.controller.on_save_to_preset)
-        self.load_from_preset_button.clicked.connect(self.controller.on_load_from_preset)
+        self.action_layout = QHBoxLayout()
+        self.action_layout.addStretch()
+        self.action_layout.addWidget(self.load_button)
+        self.action_layout.addWidget(self.write_button)
+        self.action_layout.addStretch()
 
-        self.action_layout = QGridLayout()
-        self.action_layout.setColumnStretch(0, 1)
-        self.action_layout.setColumnStretch(1, 0) # Middle item
-        self.action_layout.setColumnStretch(2, 1)
-        
-        # Left buttons container
-        self.left_actions = QHBoxLayout()
-        self.left_actions.addStretch()
-        self.left_actions.addWidget(self.load_button)
-        self.left_actions.addWidget(self.write_button)
-        
-        # Right buttons container
-        self.right_actions = QHBoxLayout()
-        self.right_actions.addWidget(self.save_to_preset_button)
-        self.right_actions.addWidget(self.load_from_preset_button)
-        self.right_actions.addStretch()
-
-        self.action_layout.addLayout(self.left_actions, 0, 0)
-        self.action_layout.addWidget(self.preset_combobox, 0, 1, Qt.AlignmentFlag.AlignCenter)
-        self.action_layout.addLayout(self.right_actions, 0, 2)
-        
         self.action_group.setLayout(self.action_layout)
 
         self.main_layout = QVBoxLayout()
         self.main_layout.addWidget(self.fancurve_group, 1) # Give more space to editor
         self.main_layout.addWidget(self.action_group, 0)
-        self.main_layout.addWidget(QLabel("La curva de ventiladores se reinicia al cambiar el modo de energía (Fn + Q)."), 0)
+        self.main_layout.addWidget(QLabel("La curva aplicada con 'Aplicar HW' se mantiene permanente (se re-aplica automáticamente al conectar/desconectar el cargador)."), 0)
         
         self.setLayout(self.main_layout)
 
@@ -1598,14 +1590,18 @@ class RealtimeGraph(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
+
         w, h = self.width(), self.height()
-        
+        is_dark = self.palette().window().color().lightness() < 128
+
         # Background
-        painter.fillRect(self.rect(), QColor("#121212"))
-        
+        painter.fillRect(self.rect(), QColor("#121212") if is_dark else QColor("#FFFFFF"))
+
+        # Title & legend text color
+        text_color = QColor("#ffffff") if is_dark else QColor("#222222")
+
         # Title
-        painter.setPen(QColor("#ffffff"))
+        painter.setPen(text_color)
         painter.drawText(10, 20, self.title)
 
         # Legend
@@ -1637,7 +1633,7 @@ class RealtimeGraph(QWidget):
             
             # Label
             value = int(self.max_value * (1.0 - y_ratio))
-            painter.setPen(QColor(150, 150, 150))
+            painter.setPen(QColor(100, 100, 100) if is_dark else QColor(80, 80, 80))
             painter.drawText(0, y + 4, 30, 20, Qt.AlignmentFlag.AlignRight, f"{value}")
             
         # Draw Charts
@@ -1717,9 +1713,9 @@ class DashboardTab(QWidget):
         frame = QGroupBox() # styled as card
         layout = QVBoxLayout()
         lbl_title = QLabel(title)
-        lbl_title.setStyleSheet("color: #888; font-size: 12px; font-weight: bold;")
+        lbl_title.setStyleSheet("font-size: 12px; font-weight: bold;")
         lbl_value = QLabel("--")
-        lbl_value.setStyleSheet("color: #fff; font-size: 24px; font-weight: bold;")
+        lbl_value.setStyleSheet("font-size: 24px; font-weight: bold;")
         lbl_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
         
         layout.addWidget(lbl_title)
@@ -1765,9 +1761,7 @@ class DashboardTab(QWidget):
         return {'container': container, 'bar': pbar, 'extra': lbl_extra}
 
     def set_mode(self, mode_name):
-        log.info("Dashboard loading preset: %s", mode_name)
-        # Only load the software preset to avoid requiring sudo for hardware changes
-        self.controller.on_load_from_preset(mode_name)
+        log.info("Dashboard mode change: %s (presets removed; no action taken)", mode_name)
 
     @pyqtSlot(object, object, object, object, str, object, object, object)
     def update_stats(self, cpu_temp, gpu_temp, fan1_rpm, fan2_rpm, profile, cpu_usage, ram_usage, gpu_usage):
@@ -1803,14 +1797,12 @@ class DashboardTab(QWidget):
 # pylint: disable=too-few-public-methods
 class Tabs(QTabWidget):
     def __init__(self, controller):
-        print("DEBUG: Tabs.__init__ started")
         super().__init__()
         # setup controller
         self.controller = controller
         self.controller.tabs = self
 
         # setup tabs
-        print("DEBUG: Creating tab views")
         self.tabs = [
             ("Panel", DashboardTab(controller)),
             ("Curva de Ventiladores", FanCurveTab(controller)),
@@ -1846,15 +1838,12 @@ class MainWindow(QMainWindow):
         self.icon = icon
         self.setWindowIcon(self.icon)
         
-        print("DEBUG: MainWindow calling init_ui")
         self.init_ui(controller)
-        print("DEBUG: MainWindow.__init__ finished")
 
 
 
     
     def init_ui(self, controller):
-        print("DEBUG: MainWindow.init_ui started")
         # tabs
         self.tabs = Tabs(controller)
 
@@ -1975,7 +1964,6 @@ class LegionTray:
         self.menu.addAction(self.rapid_charging_action)
         self.fnlock_action = QAction("Bloqueo Fn")
         self.menu.addAction(self.fnlock_action)
-        print("DEBUG: LegionTray.__init__ finished")
         self.touchpad_action = QAction("Touchpad Habilitado")
         self.menu.addAction(self.touchpad_action)
         self.always_on_usb_charging_action = QAction("Carga USB Siempre Activa")

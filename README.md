@@ -9,6 +9,18 @@
     <strong> Lenovo Legion Linux Support </strong>
 </h1>
 
+---
+
+> **[ES] AVISO — VERSIÓN FINAL**
+>
+> Este repositorio es un fork personal adaptado exclusivamente para el modelo **Lenovo Legion Pro 5 16IRX9 (83DF)**. La versión **v0.0.27** es la versión final. **No se realizarán más cambios, mejoras ni correcciones.** Si tienes un modelo diferente, utiliza el proyecto original: [johnfanv2/LenovoLegionLinux](https://github.com/johnfanv2/LenovoLegionLinux).
+
+> **[EN] NOTICE — FINAL RELEASE**
+>
+> This repository is a personal fork adapted exclusively for the **Lenovo Legion Pro 5 16IRX9 (83DF)** model. Version **v0.0.27** is the final release. **No further changes, improvements, or fixes will be made.** If you have a different model, please use the original project: [johnfanv2/LenovoLegionLinux](https://github.com/johnfanv2/LenovoLegionLinux).
+
+---
+
 [![Build](https://github.com/johnfanv2/LenovoLegionLinux/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/johnfanv2/LenovoLegionLinux/actions/workflows/build.yml)
 [![Join Discord](https://img.shields.io/discord/761178912230473768?label=Legion%20Series%20Discord)](https://discord.com/invite/legionseries)
 [![Check Reddit](https://img.shields.io/static/v1?label=Reddit&message=LenovoLegion&color=green)](https://www.reddit.com/r/LenovoLegion/)
@@ -33,6 +45,8 @@
 ---
 
 **This project is not affiliated with Lenovo in any way**
+
+> **Supported hardware:** This fork is tested and maintained **only** for the **Lenovo Legion Pro 5 16IRX9 (Model 83DF)** running Arch Linux. Use on other models is unsupported.
 
 <!-- # If you have a 2022 or 2023 model, please help testing the new features [here](https://github.com/johnfanv2/LenovoLegionLinux/issues/46).
 

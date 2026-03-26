@@ -514,9 +514,10 @@ class BatteryConservation(BoolFileFeature):
         return super().set(value)
 
     def set_if_not_set(self, value: bool) -> None:
-        if value is not self.get():
+        if value != self.get():
             self.set(value)
-        print(f"Already has value {value} - skip setting again.")
+        else:
+            log.info("BatteryConservation already has value %s - skipping.", value)
 
 
 class RapidChargingFeature(BoolFileFeature):
